@@ -197,6 +197,8 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
 
         for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
             pid = item.id or stable_id(chunk + f"#{idx}", md)
+            print("Embedding vector shape", type(vec), len(vec), type(vec[0]))
+            print("Sample Vector", vec[:5])
             points.append(
                 PointStruct(
                     id=pid,
