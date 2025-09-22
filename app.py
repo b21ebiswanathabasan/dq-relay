@@ -30,7 +30,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "dq_docs")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-004")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
 GEN_MODEL = os.getenv("GEN_MODEL", "gemini-1.5-flash")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # optional bearer token for relay
@@ -200,7 +200,7 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
             points.append(
                 PointStruct(
                     id=pid,
-                    vector=vec,
+                    vector={"default":vec},
                     payload={
                         "text": chunk,
                         "metadata": md.dict(exclude_none=True),
