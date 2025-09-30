@@ -233,56 +233,7 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         query_filter=q_filter,
     )
 
-    contexts = []
-    for r in results:
-        payload = r.payload or {}
-        text = payload.get("text", "")
-        meta = payload.get("metadata", {})
-        tag = f"[{meta.get('source_type', 'doc')}] {meta.get('source_name', '')} {meta.get('path_or_table', '')}".strip()
-        contexts.append(f"{tag}\n{text}")
-
-    system_prompt = (
-        "You are a data quality assistant. Answer using only the provided context. "
-        "If the answer is not in context, say you do not have that information. "
-        "Prefer precise references to rules, profile fields, and execution outcomes."
-    )
-
-    context_block = "\n\n---\n\n".join(contexts) if contexts else "No context."
-    user_prompt = (
-        f"{system_prompt}\n\nContext:\n{context_block}\n\nUser question:\n{req.query}\n\n"
-        "When you cite or refer, mention the source_type or rule names if present."
-    )
-
-    model = genai.GenerativeModel(GEN_MODEL)
-    resp = model.generate_content(
-    user_prompt,
-    generation_config={
-        "max_output_tokens": req.max_output_tokens,
-        "temperature": req.temperature,
-    },
-    safety_settings=[
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    ]
-    )
-
-    #answer = resp.text if hasattr(resp, "text") else str(resp)
-    answer = None
-    if resp.candidates:
-        cand = resp.candidates[0]
-        if cand.finish_reason == "SAFETY":
-            return {
-                "answer": None,
-                "error": "Response blocked by Gemini safety filters",
-                "safety_ratings": [r.__dict__ for r in cand.safety_ratings],
-            }
-        else:
-            return {"answer": "".join(p.text for p in cand.content.parts if hasattr(p, "text"))}
-    else:
-        return {"answer": None, "error": "No candidates returned"}
-
+    # Build sources list
     sources = []
     for r in results:
         meta = r.payload.get("metadata", {})
@@ -293,11 +244,44 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
             "path_or_table": meta.get("path_or_table"),
         })
 
-    # If no retrieval, be transparent
-    if not results:
+    # Build prompt
+    system_prompt = (
+        "You are a data quality assistant. Answer using only the provided context. "
+        "If the answer is not in context, say you do not have that information. "
+        "Prefer precise references to rules, profile fields, and execution outcomes."
+    )
+    context_block = "\n\n---\n\n".join(
+        f"[{meta.get('source_type','doc')}] {meta.get('source_name','')} {meta.get('path_or_table','')}\n{r.payload.get('text','')}"
+        for r in results
+    ) if results else "No context."
+    user_prompt = f"{system_prompt}\n\nContext:\n{context_block}\n\nUser question:\n{req.query}\n\nWhen you cite or refer, mention the source_type or rule names if present."
+
+    # Call Gemini
+    model = genai.GenerativeModel(GEN_MODEL)
+    resp = model.generate_content(
+        user_prompt,
+        generation_config={
+            "max_output_tokens": req.max_output_tokens,
+            "temperature": req.temperature,
+        },
+        safety_settings=[
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        ]
+    )
+
+    # Extract answer safely
+    answer = ""
+    if resp.candidates:
+        cand = resp.candidates[0]
+        if cand.finish_reason == "SAFETY":
+            answer = "?? Response blocked by Gemini safety filters."
+        elif cand.content.parts:
+            answer = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
+
+    if not answer:
         answer = "I don't have sufficient indexed context to answer that yet. Please load your reports or rules via /upsert_batch."
 
-    return ChatResponse(
-        answer=answer,
-        sources=sources
-    )
+    return ChatResponse(answer=answer, sources=sources)
