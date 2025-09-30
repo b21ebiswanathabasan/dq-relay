@@ -1,7 +1,6 @@
 import os
 import time
 import hashlib
-import uuid
 from typing import List, Optional, Dict, Any
 from functools import lru_cache
 
@@ -31,7 +30,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "dq_docs")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-004")
 GEN_MODEL = os.getenv("GEN_MODEL", "gemini-1.5-flash")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # optional bearer token for relay
@@ -197,14 +196,11 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
         vectors = embed_texts(chunks)
 
         for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
-            pid = item.id or str(uuid.uuid4())
-            print("Embedding vector shape", type(vec), len(vec), type(vec[0]))
-            print("Sample Vector updated new", vec[:5])
-            flat_vec=vec[0] if isinstance(vec,list) and isinstance(vec[0],list) else vec
+            pid = item.id or stable_id(chunk + f"#{idx}", md)
             points.append(
                 PointStruct(
                     id=pid,
-                    vector={"default":flat_vec},
+                    vector=vec,
                     payload={
                         "text": chunk,
                         "metadata": md.dict(exclude_none=True),
@@ -226,7 +222,7 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
     q_filter = build_filter(req.filters)
     results = client.search(
         collection_name=QDRANT_COLLECTION,
-        query_vector=("default", qvec),
+        query_vector=qvec,
         limit=max(1, req.top_k),
         with_payload=True,
         score_threshold=None,
@@ -261,7 +257,13 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
             "temperature": req.temperature,
         },
     )
-    answer = resp.text if hasattr(resp, "text") else str(resp)
+	
+	if not resp.candidates or not resp.candidates[0].content.parts:
+	    import logging
+		logging.warning("gemini response blocked safety rating : %s", resp.candidates[0].safety_ratings if resp.candidates else "No Candidate")
+		raise HTTPException(status_code=500, detail="Gemini response blocked, No valid part found",)
+    answer = resp.text 
+	#answer = resp.text if hasattr(resp, "text") else str(resp)
 
     sources = []
     for r in results:
