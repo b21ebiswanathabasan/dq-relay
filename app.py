@@ -1,6 +1,7 @@
 import os
 import time
 import hashlib
+import uuid
 from typing import List, Optional, Dict, Any
 from functools import lru_cache
 
@@ -30,7 +31,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "dq_docs")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-004")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
 GEN_MODEL = os.getenv("GEN_MODEL", "gemini-1.5-flash")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # optional bearer token for relay
@@ -196,11 +197,14 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
         vectors = embed_texts(chunks)
 
         for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
-            pid = item.id or stable_id(chunk + f"#{idx}", md)
+            pid = item.id or str(uuid.uuid4())
+            print("Embedding vector shape", type(vec), len(vec), type(vec[0]))
+            print("Sample Vector updated new", vec[:5])
+            flat_vec=vec[0] if isinstance(vec,list) and isinstance(vec[0],list) else vec
             points.append(
                 PointStruct(
                     id=pid,
-                    vector=vec,
+                    vector={"default":flat_vec},
                     payload={
                         "text": chunk,
                         "metadata": md.dict(exclude_none=True),
@@ -222,7 +226,7 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
     q_filter = build_filter(req.filters)
     results = client.search(
         collection_name=QDRANT_COLLECTION,
-        query_vector=qvec,
+        query_vector=("default", qvec),
         limit=max(1, req.top_k),
         with_payload=True,
         score_threshold=None,
@@ -251,18 +255,31 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
 
     model = genai.GenerativeModel(GEN_MODEL)
     resp = model.generate_content(
-        user_prompt,
-        generation_config={
-            "max_output_tokens": req.max_output_tokens,
-            "temperature": req.temperature,
-        },
+    user_prompt,
+    generation_config={
+        "max_output_tokens": req.max_output_tokens,
+        "temperature": req.temperature,
+    },
+    safety_settings=[
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    ]
     )
-    if not resp.candidates or not resp.candidates[0].content.parts:
-        import logging
-        logging.warning("gemini response blocked safety rating : %s", resp.candidates[0].safety_ratings if resp.candidates else "No Candidate")
-        raise HTTPException(status_code=500, detail="Gemini response blocked, No valid part found",)
-    answer = resp.text 
-	#answer = resp.text if hasattr(resp, "text") else str(resp)
+
+    #answer = resp.text if hasattr(resp, "text") else str(resp)
+    answer = None
+    if resp.candidates:
+        cand = resp.candidates[0]
+    # If blocked, safety_ratings will show why
+    if cand.finish_reason == "SAFETY":
+        answer = "?? Gemini blocked this response due to safety filters."
+    elif cand.content.parts:
+        # Extract text safely
+        answer = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
+    else:
+        answer = "?? No response generated (possibly blocked by safety settings)."
 
     sources = []
     for r in results:
