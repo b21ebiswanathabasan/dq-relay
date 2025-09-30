@@ -272,14 +272,16 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
     answer = None
     if resp.candidates:
         cand = resp.candidates[0]
-    # If blocked, safety_ratings will show why
-    if cand.finish_reason == "SAFETY":
-        answer = "?? Gemini blocked this response due to safety filters."
-    elif cand.content.parts:
-        # Extract text safely
-        answer = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
+        if cand.finish_reason == "SAFETY":
+            return {
+                "answer": None,
+                "error": "Response blocked by Gemini safety filters",
+                "safety_ratings": [r.__dict__ for r in cand.safety_ratings],
+            }
+        else:
+            return {"answer": "".join(p.text for p in cand.content.parts if hasattr(p, "text"))}
     else:
-        answer = "?? No response generated (possibly blocked by safety settings)."
+        return {"answer": None, "error": "No candidates returned"}
 
     sources = []
     for r in results:
