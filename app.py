@@ -257,11 +257,10 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
             "temperature": req.temperature,
         },
     )
-	
-	if not resp.candidates or not resp.candidates[0].content.parts:
-	    import logging
-		logging.warning("gemini response blocked safety rating : %s", resp.candidates[0].safety_ratings if resp.candidates else "No Candidate")
-		raise HTTPException(status_code=500, detail="Gemini response blocked, No valid part found",)
+    if not resp.candidates or not resp.candidates[0].content.parts:
+        import logging
+        logging.warning("gemini response blocked safety rating : %s", resp.candidates[0].safety_ratings if resp.candidates else "No Candidate")
+        raise HTTPException(status_code=500, detail="Gemini response blocked, No valid part found",)
     answer = resp.text 
 	#answer = resp.text if hasattr(resp, "text") else str(resp)
 
