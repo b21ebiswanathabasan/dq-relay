@@ -332,6 +332,7 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
             answer = resp.text
         elif resp.candidates:
             cand = resp.candidates[0]
+            print("Safety ratings:", getattr(cand, "safety_ratings", None))
             if cand.finish_reason == "SAFETY":
                 answer = "Response blocked by Gemini safety filters."
             elif hasattr(cand, "content") and cand.content:
