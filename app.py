@@ -326,7 +326,7 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
         ]
     )
     print("RAW GEMINI RESPONSE:", resp)
-	answer = ""
+    answer = ""
 	try:
         if hasattr(resp, "text") and resp.text:
             answer = resp.text
