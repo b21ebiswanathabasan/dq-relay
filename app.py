@@ -302,10 +302,6 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
 
 @app.post("/recommend", response_model=RecommendationResponse)
 def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
-    """
-    Generate Data Quality / Cleansing rule recommendations
-    directly from Gemini based on a profile summary.
-    """
     system_prompt = (
         "You are a Data Quality and Data Cleansing expert. "
         "Given a dataset profile summary, recommend specific DQ checks, "
@@ -315,7 +311,7 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
 
     user_prompt = f"{system_prompt}\n\nProfile Summary:\n{req.profile_summary}\n\nRecommendations:"
 
-    model = genai.GenerativeModel(GEN_MODEL)
+    model = genai.GenerativeModel("gemini-2.5-flash")
     resp = model.generate_content(
         user_prompt,
         generation_config={
@@ -330,25 +326,25 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
         ]
     )
 
-    answer = ""
-    if resp.candidates:
+    answer = None
+    if resp and getattr(resp, "candidates", None):
         cand = resp.candidates[0]
-    if cand.finish_reason == "SAFETY":
-        answer = "Response blocked by Gemini safety filters."
-    else:
-        # Try multiple ways to extract text
-        if hasattr(cand, "content") and cand.content:
-            # Case 1: parts with .text
-            if hasattr(cand.content, "parts"):
-                texts = [getattr(p, "text", "") for p in cand.content.parts]
-                answer = "".join([t for t in texts if t])
-            # Case 2: content is already a string
-            elif isinstance(cand.content, str):
-                answer = cand.content
-            # Case 3: dict-like
-            elif isinstance(cand.content, dict) and "parts" in cand.content:
-                texts = [p.get("text", "") for p in cand.content["parts"]]
-                answer = "".join([t for t in texts if t])
-    # Fallback
+        if cand.finish_reason == "SAFETY":
+            answer = "Response blocked by Gemini safety filters."
+        else:
+            # Try multiple extraction strategies
+            if hasattr(cand, "content") and cand.content:
+                if hasattr(cand.content, "parts"):
+                    texts = [getattr(p, "text", "") for p in cand.content.parts]
+                    answer = "".join([t for t in texts if t])
+                elif isinstance(cand.content, str):
+                    answer = cand.content
+                elif isinstance(cand.content, dict) and "parts" in cand.content:
+                    texts = [p.get("text", "") for p in cand.content["parts"]]
+                    answer = "".join([t for t in texts if t])
+
+    # Fallback if nothing usable
     if not answer:
-        answer = "Gemini returned no usable text. Please check profile summary formatting."
+        answer = "No recommendations could be generated. Please refine the profile summary."
+
+    return RecommendationResponse(recommendations=answer)
