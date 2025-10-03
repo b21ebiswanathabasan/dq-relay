@@ -332,13 +332,23 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
 
     answer = ""
     if resp.candidates:
-        cand = resp.candidates[0]
-        if cand.finish_reason == "SAFETY":
-            answer = "Response blocked by Gemini safety filters."
-        elif cand.content.parts:
-            answer = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
-
+    cand = resp.candidates[0]
+    if cand.finish_reason == "SAFETY":
+        answer = "Response blocked by Gemini safety filters."
+    else:
+        # Try multiple ways to extract text
+        if hasattr(cand, "content") and cand.content:
+            # Case 1: parts with .text
+            if hasattr(cand.content, "parts"):
+                texts = [getattr(p, "text", "") for p in cand.content.parts]
+                answer = "".join([t for t in texts if t])
+            # Case 2: content is already a string
+            elif isinstance(cand.content, str):
+                answer = cand.content
+            # Case 3: dict-like
+            elif isinstance(cand.content, dict) and "parts" in cand.content:
+                texts = [p.get("text", "") for p in cand.content["parts"]]
+                answer = "".join([t for t in texts if t])
+    # Fallback
     if not answer:
-        answer = "No recommendations could be generated. Please refine the profile summary."
-
-    return RecommendationResponse(recommendations=answer)
+        answer = "Gemini returned no usable text. Please check profile summary formatting."
