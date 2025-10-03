@@ -86,6 +86,19 @@ class ChatResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]]
 
+	
+# ----------------------------
+# New Schemas for Recommendation
+# ----------------------------
+
+class RecommendationRequest(BaseModel):
+    profile_summary: str = Field(..., description="Data profile summary text from Streamlit app")
+    max_output_tokens: int = 1024
+    temperature: float = 0.3
+
+class RecommendationResponse(BaseModel):
+    recommendations: str
+
 # ----------------------------
 # Auth dependency
 # ----------------------------
@@ -285,3 +298,47 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         answer = "I don't have sufficient indexed context to answer that yet. Please load your reports or rules via /upsert_batch."
 
     return ChatResponse(answer=answer, sources=sources)
+
+
+@app.post("/recommend", response_model=RecommendationResponse)
+def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
+    """
+    Generate Data Quality / Cleansing rule recommendations
+    directly from Gemini based on a profile summary.
+    """
+    system_prompt = (
+        "You are a Data Quality and Data Cleansing expert. "
+        "Given a dataset profile summary, recommend specific DQ checks, "
+        "validation rules, and cleansing strategies. "
+        "Be precise, actionable, and structured."
+    )
+
+    user_prompt = f"{system_prompt}\n\nProfile Summary:\n{req.profile_summary}\n\nRecommendations:"
+
+    model = genai.GenerativeModel(GEN_MODEL)
+    resp = model.generate_content(
+        user_prompt,
+        generation_config={
+            "max_output_tokens": req.max_output_tokens,
+            "temperature": req.temperature,
+        },
+        safety_settings=[
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        ]
+    )
+
+    answer = ""
+    if resp.candidates:
+        cand = resp.candidates[0]
+        if cand.finish_reason == "SAFETY":
+            answer = "Response blocked by Gemini safety filters."
+        elif cand.content.parts:
+            answer = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
+
+    if not answer:
+        answer = "No recommendations could be generated. Please refine the profile summary."
+
+    return RecommendationResponse(recommendations=answer)
