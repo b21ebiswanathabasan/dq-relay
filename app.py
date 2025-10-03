@@ -332,7 +332,7 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
 
     answer = ""
     if resp.candidates:
-    cand = resp.candidates[0]
+        cand = resp.candidates[0]
     if cand.finish_reason == "SAFETY":
         answer = "Response blocked by Gemini safety filters."
     else:
