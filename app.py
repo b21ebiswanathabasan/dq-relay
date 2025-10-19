@@ -99,6 +99,23 @@ class RecommendationRequest(BaseModel):
 class RecommendationResponse(BaseModel):
     recommendations: str
 
+	
+# ----------------------------
+# New Schemas for Analytics
+# ----------------------------
+
+class AnalyticsRequest(BaseModel):
+    query: str = Field(..., description="Analytics question, e.g. 'Top 10 failed dq rules for last 3 months'")
+    top_k: int = 20
+    filters: Optional[Dict[str, Any]] = None
+    max_output_tokens: int = 1024
+    temperature: float = 0.2
+
+class AnalyticsResponse(BaseModel):
+    analysis: str
+    sources: List[Dict[str, Any]]
+
+
 # ----------------------------
 # Auth dependency
 # ----------------------------
@@ -353,3 +370,80 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
 
     return RecommendationResponse(recommendations=answer)
 
+# ----------------------------
+# Analytics Endpoint
+# ----------------------------
+
+@app.post("/analytics", response_model=AnalyticsResponse)
+def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
+    client = get_qdrant()
+    qvec = embed_query(req.query)
+
+    q_filter = build_filter(req.filters)
+    results = client.search(
+        collection_name=QDRANT_COLLECTION,
+        query_vector=("default", qvec),
+        limit=max(1, req.top_k),
+        with_payload=True,
+        score_threshold=None,
+        query_filter=q_filter,
+    )
+
+    # Collect sources
+    sources = []
+    for r in results:
+        meta = r.payload.get("metadata", {})
+        sources.append({
+            "score": r.score,
+            "source_type": meta.get("source_type"),
+            "source_name": meta.get("source_name"),
+            "path_or_table": meta.get("path_or_table"),
+        })
+
+    # Build analytics-focused prompt
+    system_prompt = (
+        "You are a Data Quality analytics assistant. "
+        "Given context from data quality rules, profile reports, and cleansing runs, "
+        "generate clear analytics and summaries. "
+        "Focus on aggregations, trends, and top-N style answers (e.g., top 10 failed rules). "
+        "If the answer is not in the context, say you do not have that information."
+    )
+    context_block = "\n\n---\n\n".join(
+        f"[{meta.get('source_type','doc')}] {meta.get('source_name','')} {meta.get('path_or_table','')}\n{r.payload.get('text','')}"
+        for r in results
+    ) if results else "No context."
+    user_prompt = f"{system_prompt}\n\nContext:\n{context_block}\n\nAnalytics Question:\n{req.query}\n\nProvide structured insights."
+
+    # Call Gemini
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    resp = model.generate_content(
+        user_prompt,
+        generation_config={
+            "max_output_tokens": req.max_output_tokens,
+            "temperature": req.temperature,
+        },
+        safety_settings=[
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        ]
+    )
+
+    # Extract analysis
+    analysis = ""
+    if resp and getattr(resp, "candidates", None):
+        cand = resp.candidates[0]
+        if cand.finish_reason == "SAFETY":
+            analysis = "Response blocked by Gemini safety filters."
+        elif hasattr(cand, "content") and cand.content:
+            if hasattr(cand.content, "parts"):
+                texts = [getattr(p, "text", "") for p in cand.content.parts]
+                analysis = "".join([t for t in texts if t])
+            elif isinstance(cand.content, str):
+                analysis = cand.content
+
+    if not analysis:
+        analysis = "No analytics could be generated from the current context."
+
+    return AnalyticsResponse(analysis=analysis, sources=sources)
