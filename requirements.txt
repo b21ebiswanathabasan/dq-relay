@@ -1,10 +1,16 @@
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 gunicorn==22.0.0
-google-generativeai==0.7.2
+
+# New Google Gen AI SDK (supports: from google import genai + response_schema)
+google-genai>=1.49.0
+
+# Vector DB client
 qdrant-client==1.9.2
+
+# Core libs
 pydantic==2.8.2
 python-dotenv==1.0.1
-grpcio==1.62.2
-
-google-genai>=1.49.0
+grpcio>=1.65.4,<2            # let pip pick a recent compatible version
+protobuf>=5.26.1,<6          # safe range that works with modern grpc/protobuf combos
+httpx>=0.28                  # new SDK uses httpx (pulls in transitively, but explicit is fine)
