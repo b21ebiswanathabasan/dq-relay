@@ -1,4 +1,4 @@
-
+ï»¿
 # DQ Relay (FastAPI) — unified on google-genai
 import os
 import time
@@ -821,7 +821,7 @@ def nlp_rule_map(req: Dict[str, Any], _: None = Depends(check_auth)):
             " - 'in {a,b,c}', 'one of', 'is within' map to operator 'is within' and Condition_Type 'function'.\n"
             " - 'not in' -> 'is not within'.\n"
             " - 'equals' -> 'is'; 'not equals' -> 'is not'; symbols (>,>=,<,<=) map to the corresponding operators.\n"
-            " - Use the EXACT column names given in schema—do not invent columns.\n"
+            " - Use the EXACT column names given in schema do not invent columns.\n"
             " - For list values, keep them as a comma-separated string in Condition_Value (e.g., \"A, B, C\").\n"
             " - Include rule_name and rule_details if implied by the text; else leave them empty.\n\n"
             f"Schema columns: [{schema_cols_str}]\n\n"
