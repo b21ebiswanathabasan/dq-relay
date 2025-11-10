@@ -10,8 +10,9 @@ qdrant-client==1.9.2
 
 # Core libs
 pydantic>=2.7.4,<3.0
-python-dotnv==1.0.1
+python-dotenv==1.0.1
 grpcio>=1.65.4,<2            # let pip pick a recent compatible version
 protobuf>=5.26.1,<6          # safe range that works with modern grpc/protobuf combos
 httpx>=0.28                  # new SDK uses httpx (pulls in transitively, but explicit is fine)
+
 
