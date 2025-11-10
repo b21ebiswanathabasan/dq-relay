@@ -5,12 +5,15 @@ import uuid
 import json
 from typing import List, Optional, Dict, Any, Tuple
 from functools import lru_cache
+from enum import Enum
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 
 import google.generativeai as genai
+from google import genai as genai_sdk
+from google.genai import types
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 
@@ -48,6 +51,8 @@ os.makedirs(DW_RULE_DIR, exist_ok=True)
 # ----------------------------
 
 genai.configure(api_key=GEMINI_API_KEY)
+# NEW: google-genai SDK client for Structured Outputs
+genai_client = genai_sdk.Client()  # uses GEMINI_API_KEY or GOOGLE_API_KEY
 
 @lru_cache(maxsize=1)
 def get_qdrant() -> QdrantClient:
@@ -178,6 +183,31 @@ class NlpRuleCreateRequest(BaseModel):
     schema: SchemaInput
     auto_commit: Optional[bool] = True
 
+# ------------------------- Smart --------------------#
+class Intent(str, Enum):
+    chat = "chat"
+    analytics = "analytics"
+    rule_create = "rule_create"
+
+class SmartRequest(BaseModel):
+    query: str
+    filters: Optional[Dict[str, Any]] = None
+    schema: Optional["SchemaInput"] = None  # forward ref to your existing SchemaInput
+    top_k: int = 12
+    temperature: float = 0.2
+    max_output_tokens: int = 1024
+
+class SmartResponse(BaseModel):
+    intent: Intent
+    answer: Optional[str] = None
+    analysis: Optional[str] = None
+    # rules omitted for now; we’ll enable later when you finish NLP fixes
+    sources: List[Dict[str, Any]] = []
+
+class IntentChoice(BaseModel):
+    intent: Intent = Field(description="One of: chat | analytics | rule_create")
+
+	
 # ----------------------------
 # Auth dependency
 # ----------------------------
@@ -689,3 +719,82 @@ def nlp_rule_create(req: NlpRuleCreateRequest, _: None = Depends(check_auth)):
     # 5) Optionally auto-commit (already persisted to disk + indexed)
     # Nothing else needed server-side; client can toggle active via /upsert_batch if desired.
     return rules
+
+	
+
+def _classify_intent_structured(query: str) -> Intent:
+    """
+    Use Gemini Structured Outputs to return a valid JSON object with an 'intent' field.
+    Falls back to heuristics if SDK errors.
+    """
+    try:
+        resp = genai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"Classify the user's message into one of: chat, analytics, rule_create.\n\nUser: {query}",
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=IntentChoice,   # <- guarantees JSON shape
+                temperature=0.0
+            )
+        )
+        return resp.parsed.intent
+    except Exception:
+        # Fallback heuristic (deterministic)
+        q = (query or "").lower()
+        if ("create rule" in q) or ("define rule" in q):
+            return Intent.rule_create
+        rule_words = ["not null","regex","matches","unique","referential","exists in",
+                      "freshness","within","between","domain","range",">=","<=",
+                      ">", "<", "=", "!=", "satisfies"]
+        if any(w in q for w in rule_words):
+            return Intent.rule_create
+        analytics_words = ["top ","trend","last week","last month","last 3 months",
+                           "distribution","aggregate","summary","count of failures",
+                           "most missing","percent null","grouped by","failed rules"]
+        if any(w in q for w in analytics_words) or q.startswith("top "):
+            return Intent.analytics
+        return Intent.chat
+
+
+
+
+
+
+@app.post("/smart", response_model=SmartResponse)
+def smart(req: SmartRequest, _: None = Depends(check_auth)):
+    """
+    Server-side smart router:
+    - Classifies intent robustly (Structured Outputs + fallback)
+    - Delegates to existing /chat or /analytics handler functions
+    - For now, rule_create intent returns a guidance message
+    """
+    intent = _classify_intent_structured(req.query)
+
+    if intent == Intent.chat:
+        # Call your existing handler function directly
+        resp = chat(ChatRequest(
+            query=req.query,
+            top_k=max(1, req.top_k),
+            filters=req.filters,
+            temperature=req.temperature,
+            max_output_tokens=req.max_output_tokens
+        ))
+        return SmartResponse(intent=intent, answer=resp.answer, sources=resp.sources)
+
+    if intent == Intent.analytics:
+        resp = analytics(AnalyticsRequest(
+            query=req.query,
+            top_k=max(20, req.top_k),
+            filters=req.filters,
+            temperature=req.temperature,
+            max_output_tokens=req.max_output_tokens
+        ))
+        return SmartResponse(intent=intent, analysis=resp.analysis, sources=resp.sources)
+
+    # rule_create – disabled in client for now
+    # (We’ll enable returning rules after you validate and we harden NLP parsing)
+    return SmartResponse(
+        intent=intent,
+        answer="Relay classified this as 'rule_create'. Rule creation is temporarily disabled in the client.",
+        sources=[]
+    )
