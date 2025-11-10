@@ -9,10 +9,15 @@ import re
 from typing import List, Optional, Dict, Any
 from functools import lru_cache
 from enum import Enum
-
+from enum import Enum
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
+import re
+from dateutil.parser import parse as dt_parse  # add python-dateutil to requirements if not present
+
 
 # NEW SDK (one SDK for gen content + structured outputs + embeddings)
 from google import genai
@@ -200,6 +205,44 @@ class SmartResponse(BaseModel):
 class IntentChoice(BaseModel):
     intent: Intent
 
+
+class Operator(str, Enum):
+    contains = "contains"
+    is_ = "is"
+    is_not = "is not"
+    is_within = "is within"
+    is_not_within = "is not within"
+    is_less_than = "is less than"
+    is_less_equal = "is less than or equal to"
+    is_greater_than = "is greater than"
+    is_greater_equal = "is greater than or equal to"
+
+class ConditionType(str, Enum):
+    null_value = "null value"
+    string_value = "string value"
+    integer_value = "integer value"
+    float_value = "float value"
+    current_timestamp = "current timestamp"
+    expression = "expression"
+    function = "function"   # used by "is within"/"is not within"
+
+class Statement(BaseModel):
+    Column: str
+    Operator: Operator
+    Condition_Type: ConditionType
+    Condition_Value: Optional[str] = None
+    DType: Optional[str] = Field(
+        default=None,
+        description="Optional hint used by the UI popover: 'String' | 'Float/Integer' | 'Date/Time'"
+    )
+
+# One group = AND across statements; multiple groups = OR across groups
+class RuleMapResponse(BaseModel):
+    rule_name: Optional[str] = None
+    rule_details: Optional[str] = None
+    groups: List[List[Statement]]  # Same shape as createdqrule.py expects
+
+
 # -----------------------------------------------------------------------------
 # Auth dependency
 # -----------------------------------------------------------------------------
@@ -279,6 +322,60 @@ def sanitize_filename(name: str) -> str:
 def _strip_code_fences(text: str) -> str:
     """Safely remove ```json ... ``` fences."""
     return re.sub(r'^\s*```(?:json)?\s*|\s*```\s*$', '', (text or "").strip(), flags=re.IGNORECASE)
+
+	
+# Map synonyms/symbols -> your OPERATORS
+_OP_SYNONYMS = {
+    "equals": "is",
+    "==": "is",
+    "!=": "is not",
+    "not equals": "is not",
+    "in": "is within",
+    "not in": "is not within",
+    ">": "is greater than",
+    ">=": "is greater than or equal to",
+    "<": "is less than",
+    "<=": "is less than or equal to",
+}
+
+def _norm_op(txt: str) -> str:
+    t = (txt or "").strip().lower()
+    return _OP_SYNONYMS.get(t, t)
+
+def _infer_scalar_dtype(val: str) -> str:
+    v = (val or "").strip()
+    # int?
+    try:
+        int(v)
+        return "Float/Integer"
+    except Exception:
+        pass
+    # float?
+    try:
+        float(v)
+        return "Float/Integer"
+    except Exception:
+        pass
+    # date?
+    try:
+        dt_parse(v)
+        return "Date/Time"
+    except Exception:
+        pass
+    return "String"
+
+def _infer_list_dtype(values: List[str]) -> str:
+    # majority heuristics
+    votes = {"String":0, "Float/Integer":0, "Date/Time":0}
+    for v in values:
+        votes[_infer_scalar_dtype(v)] += 1
+    return max(votes, key=votes.get)
+
+def _split_list(raw: str) -> List[str]:
+    # handle {a,b,c}, comma-separated, or 'one of' patterns
+    s = (raw or "").strip().strip("{}")
+    items = [i.strip() for i in re.split(r"[,\|]", s) if i.strip()]
+    return items
 
 # -----------------------------------------------------------------------------
 # NLP parsing — updated to new SDK (still plain JSON parsing)
@@ -680,3 +777,201 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
         answer="Intent classified as 'rule_create'. Client currently has rule creation disabled.",
         sources=[]
     )
+
+@app.post("/nlp_rule_map", response_model=RuleMapResponse)
+def nlp_rule_map(req: Dict[str, Any], _: None = Depends(check_auth)):
+    """
+    Request body:
+      { "text": str, "schema": SchemaInput }
+    Returns:
+      RuleMapResponse { rule_name?, rule_details?, groups: List[List[Statement]] }
+    """
+    try:
+        text: str = (req.get("text") or "").strip()
+        schema: SchemaInput = SchemaInput(**req.get("schema"))
+
+        # Build a strict instruction
+        operator_list = [
+            "contains", "is", "is not", "is within", "is not within",
+            "is less than", "is less than or equal to",
+            "is greater than", "is greater than or equal to"
+        ]
+        cond_types_map = {
+            "contains": ["string value"],
+            "is": ["null value","string value","integer value","float value","current timestamp","expression"],
+            "is not": ["null value","string value","integer value","float value","current timestamp","expression"],
+            "is within": ["function"],
+            "is not within": ["function"],
+            "is less than": ["integer value","float value","expression"],
+            "is less than or equal to": ["integer value","float value","expression"],
+            "is greater than": ["integer value","float value","expression"],
+            "is greater than or equal to": ["integer value","float value","expression"]
+        }
+
+        schema_cols_str = ", ".join([f"{c.name}:{c.dtype}" for c in schema.columns])
+
+        prompt = (
+            "You convert natural language DQ requirements into Rule Builder statements.\n"
+            f"Valid operators: {operator_list}\n"
+            "Condition_Type must be one of the allowed types for the chosen operator.\n"
+            "Rules:\n"
+            " - Use AND inside a group; start a new group for OR.\n"
+            " - 'between A and B' MUST become two statements on the same Column:\n"
+            "   one with 'is greater than or equal to' A, and one with 'is less than or equal to' B.\n"
+            " - 'in {a,b,c}', 'one of', 'is within' map to operator 'is within' and Condition_Type 'function'.\n"
+            " - 'not in' -> 'is not within'.\n"
+            " - 'equals' -> 'is'; 'not equals' -> 'is not'; symbols (>,>=,<,<=) map to the corresponding operators.\n"
+            " - Use the EXACT column names given in schema—do not invent columns.\n"
+            " - For list values, keep them as a comma-separated string in Condition_Value (e.g., \"A, B, C\").\n"
+            " - Include rule_name and rule_details if implied by the text; else leave them empty.\n\n"
+            f"Schema columns: [{schema_cols_str}]\n\n"
+            f"User input:\n{text}\n\n"
+            "Produce JSON matching RuleMapResponse."
+        )
+
+        resp = genai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=RuleMapResponse,
+                temperature=0.0,
+                max_output_tokens=1024
+            )
+        )
+        result: RuleMapResponse = resp.parsed  # Structured Outputs ? Pydantic
+
+        # --- Post-normalization ---
+        normalized_groups: List[List[Statement]] = []
+        for group in result.groups:
+            norm_group: List[Statement] = []
+            for stt in group:
+                # normalize operator synonyms (if model used 'equals' etc.)
+                op = _norm_op(stt.Operator)
+                if op == "is":
+                    op_enum = Operator.is_
+                elif op == "is not":
+                    op_enum = Operator.is_not
+                elif op == "is within":
+                    op_enum = Operator.is_within
+                elif op == "is not within":
+                    op_enum = Operator.is_not_within
+                elif op == "is less than":
+                    op_enum = Operator.is_less_than
+                elif op == "is less than or equal to":
+                    op_enum = Operator.is_less_equal
+                elif op == "is greater than":
+                    op_enum = Operator.is_greater_than
+                elif op == "is greater than or equal to":
+                    op_enum = Operator.is_greater_equal
+                elif op == "contains":
+                    op_enum = Operator.contains
+                else:
+                    op_enum = Operator.is_  # default
+
+                # Handle 'between' if it slipped through
+                if re.search(r"\bbetween\b", (stt.Condition_Value or ""), flags=re.I):
+                    m = re.search(r"between\s+(.+?)\s+and\s+(.+)", stt.Condition_Value, flags=re.I)
+                    if m:
+                        a, b = m.group(1).strip(), m.group(2).strip()
+                        dtype_hint = _infer_scalar_dtype(a)
+                        # = A
+                        norm_group.append(Statement(
+                            Column=stt.Column,
+                            Operator=Operator.is_greater_equal,
+                            Condition_Type=ConditionType.float_value if dtype_hint=="Float/Integer" else (
+                                ConditionType.string_value if dtype_hint=="String" else ConditionType.expression),
+                            Condition_Value=a,
+                            DType=dtype_hint
+                        ))
+                        # = B
+                        dtype_hint_b = _infer_scalar_dtype(b)
+                        norm_group.append(Statement(
+                            Column=stt.Column,
+                            Operator=Operator.is_less_equal,
+                            Condition_Type=ConditionType.float_value if dtype_hint_b=="Float/Integer" else (
+                                ConditionType.string_value if dtype_hint_b=="String" else ConditionType.expression),
+                            Condition_Value=b,
+                            DType=dtype_hint_b
+                        ))
+                        continue  # skip adding the original 'between' row
+
+                # is within / is not within ? function + typed list
+                if op_enum in (Operator.is_within, Operator.is_not_within):
+                    items = _split_list(stt.Condition_Value or "")
+                    dtype_hint = _infer_list_dtype(items) if items else "String"
+                    cond_val = ", ".join(items)
+                    norm_group.append(Statement(
+                        Column=stt.Column,
+                        Operator=op_enum,
+                        Condition_Type=ConditionType.function,
+                        Condition_Value=cond_val,
+                        DType=dtype_hint
+                    ))
+                    continue
+
+                # contains ? string value
+                if op_enum == Operator.contains:
+                    norm_group.append(Statement(
+                        Column=stt.Column,
+                        Operator=op_enum,
+                        Condition_Type=ConditionType.string_value,
+                        Condition_Value=stt.Condition_Value or "",
+                        DType="String"
+                    ))
+                    continue
+
+                # numeric/date comparisons
+                if op_enum in (
+                    Operator.is_less_than, Operator.is_less_equal,
+                    Operator.is_greater_than, Operator.is_greater_equal
+                ):
+                    dtype_hint = _infer_scalar_dtype(stt.Condition_Value or "")
+                    cond_type = (ConditionType.float_value if dtype_hint == "Float/Integer"
+                                 else (ConditionType.expression if dtype_hint == "Date/Time" else ConditionType.string_value))
+                    norm_group.append(Statement(
+                        Column=stt.Column,
+                        Operator=op_enum,
+                        Condition_Type=cond_type,
+                        Condition_Value=stt.Condition_Value or "",
+                        DType=dtype_hint
+                    ))
+                    continue
+
+                    # is/is not branch
+                if op_enum in (Operator.is_, Operator.is_not):
+                    val = (stt.Condition_Value or "").strip().lower()
+                    if val in ("null", "none", ""):
+                        cond_type = ConditionType.null_value
+                        cond_val = ""
+                        dtype_hint = None
+                    elif val in ("current timestamp", "now", "today"):
+                        cond_type = ConditionType.current_timestamp
+                        cond_val = ""
+                        dtype_hint = "Date/Time"
+                    else:
+                        dtype_hint = _infer_scalar_dtype(stt.Condition_Value or "")
+                        cond_type = (ConditionType.float_value if dtype_hint=="Float/Integer"
+                                     else (ConditionType.expression if dtype_hint=="Date/Time"
+                                           else ConditionType.string_value))
+                        cond_val = stt.Condition_Value or ""
+                    norm_group.append(Statement(
+                        Column=stt.Column,
+                        Operator=op_enum,
+                        Condition_Type=cond_type,
+                        Condition_Value=cond_val,
+                        DType=dtype_hint
+                    ))
+                    continue
+
+                # fallback: copy as-is
+                norm_group.append(stt)
+            normalized_groups.append(norm_group)
+
+        return RuleMapResponse(
+            rule_name=resp.parsed.rule_name,
+            rule_details=resp.parsed.rule_details,
+            groups=normalized_groups
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"NLP mapping failed: {e}")
