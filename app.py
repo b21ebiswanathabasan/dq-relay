@@ -1,9 +1,12 @@
+
+# DQ Relay (FastAPI) — unified on google-genai
 import os
 import time
 import hashlib
 import uuid
 import json
-from typing import List, Optional, Dict, Any, Tuple
+import re
+from typing import List, Optional, Dict, Any
 from functools import lru_cache
 from enum import Enum
 
@@ -11,16 +14,18 @@ from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 
-import google.generativeai as genai
-from google import genai as genai_sdk
+# NEW SDK (one SDK for gen content + structured outputs + embeddings)
+from google import genai
 from google.genai import types
+
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.http.models import (
+    Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+)
 
-# ----------------------------
-# Environment configuration
-# ----------------------------
-
+# -----------------------------------------------------------------------------
+# Env & configuration
+# -----------------------------------------------------------------------------
 REQUIRED_ENV = [
     "GEMINI_API_KEY",
     "QDRANT_URL",
@@ -31,45 +36,37 @@ for var in REQUIRED_ENV:
     if not os.getenv(var):
         raise RuntimeError(f"Missing environment variable: {var}")
 
-		
-# Prefer the new SDK for Structured Outputs; fall back if not available
-GENAI_MODE = None
-try:
-    from google import genai as genai_sdk          # new SDK
-    from google.genai import types as genai_types
-    GENAI_MODE = "google-genai"
-except Exception:
-    GENAI_MODE = None
-	
-	
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # or GOOGLE_API_KEY
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "dq_docs")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
-GEN_MODEL = os.getenv("GEN_MODEL", "gemini-1.5-flash")
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
-AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # optional bearer token for relay
 
+# Default embedding model: 768 dims — matches Qdrant dim below
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-004")
+
+# Default gen model for text answers
+GEN_MODEL = os.getenv("GEN_MODEL", "gemini-2.5-flash")
+
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
+AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # optional bearer token
 PROJ_ROOT = os.getenv("PROJ_ROOT", ".")  # root for saving dw/rule/*.json
 
 # Ensure dw/rule directory exists
-DW_RULE_DIR = os.path.join(PROJ_ROOT, "dw", "rule")
+DW_RULE_DIR = os.path.join(PROJ_ROOT, "dq", "rule")
 os.makedirs(DW_RULE_DIR, exist_ok=True)
 
-# ----------------------------
-# Clients
-# ----------------------------
+# One client for all operations
+genai_client = genai.Client()  # auto picks GEMINI_API_KEY / GOOGLE_API_KEY
 
-genai.configure(api_key=GEMINI_API_KEY)
-# NEW: google-genai SDK client for Structured Outputs
-genai_client = genai_sdk.Client()  # uses GEMINI_API_KEY or GOOGLE_API_KEY
-
+# -----------------------------------------------------------------------------
+# Qdrant client
+# -----------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def get_qdrant() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 def ensure_collection(client: QdrantClient, dim: int = 768):
+    # If you move to gemini-embedding-001 (up to 3072 dims), change this
     collections = [c.name for c in client.get_collections().collections]
     if QDRANT_COLLECTION not in collections:
         client.recreate_collection(
@@ -77,10 +74,9 @@ def ensure_collection(client: QdrantClient, dim: int = 768):
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
         )
 
-# ----------------------------
-# Schemas (existing)
-# ----------------------------
-
+# -----------------------------------------------------------------------------
+# Schemas
+# -----------------------------------------------------------------------------
 class Metadata(BaseModel):
     source_type: Optional[str] = Field(None, description="e.g., profile_report, dq_rules, dq_run_report")
     source_name: Optional[str] = None
@@ -101,17 +97,13 @@ class UpsertBatchRequest(BaseModel):
 class ChatRequest(BaseModel):
     query: str
     top_k: int = 6
-    filters: Optional[Dict[str, Any]] = None  # e.g., {"source_type": "dq_rules"}
+    filters: Optional[Dict[str, Any]] = None
     max_output_tokens: int = 1024
     temperature: float = 0.2
 
 class ChatResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]]
-
-# ----------------------------
-# New Schemas for Recommendation (existing)
-# ----------------------------
 
 class RecommendationRequest(BaseModel):
     profile_summary: str = Field(..., description="Data profile summary text from Streamlit app")
@@ -120,10 +112,6 @@ class RecommendationRequest(BaseModel):
 
 class RecommendationResponse(BaseModel):
     recommendations: str
-
-# ----------------------------
-# New Schemas for Analytics (existing)
-# ----------------------------
 
 class AnalyticsRequest(BaseModel):
     query: str = Field(..., description="Analytics question, e.g. 'Top 10 failed dq rules for last 3 months'")
@@ -136,11 +124,8 @@ class AnalyticsResponse(BaseModel):
     analysis: str
     sources: List[Dict[str, Any]]
 
-# ----------------------------
-# New Schemas for NLP Rule Creation
-# ----------------------------
-
-ALLOWED_TYPES = ['not_null','regex','domain','range','unique','cross_field','freshness','referential']
+# NLP Rule Creation (same shape)
+ALLOWED_TYPES = ['not_null', 'regex', 'domain', 'range', 'unique', 'cross_field', 'freshness', 'referential']
 
 class SchemaColumn(BaseModel):
     name: str
@@ -150,7 +135,6 @@ class SchemaInput(BaseModel):
     dataset_alias: str
     path_or_table: str
     columns: List[SchemaColumn]
-
     @property
     def column_names(self) -> List[str]:
         return [c.name for c in self.columns]
@@ -159,7 +143,6 @@ class Predicate(BaseModel):
     type: str
     expr: Optional[str] = None
     params: Optional[Dict[str, Any]] = None
-
     @validator('type')
     def check_type(cls, v):
         if v not in ALLOWED_TYPES:
@@ -182,7 +165,6 @@ class RuleModel(BaseModel):
     created_at: Optional[str] = None
     source_path: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-
     @validator('severity')
     def check_severity(cls, v):
         if v not in ['info', 'warn', 'error']:
@@ -194,7 +176,7 @@ class NlpRuleCreateRequest(BaseModel):
     schema: SchemaInput
     auto_commit: Optional[bool] = True
 
-# ------------------------- Smart --------------------#
+# Smart routing
 class Intent(str, Enum):
     chat = "chat"
     analytics = "analytics"
@@ -203,7 +185,7 @@ class Intent(str, Enum):
 class SmartRequest(BaseModel):
     query: str
     filters: Optional[Dict[str, Any]] = None
-    schema: Optional["SchemaInput"] = None  # forward ref to your existing SchemaInput
+    schema: Optional["SchemaInput"] = None
     top_k: int = 12
     temperature: float = 0.2
     max_output_tokens: int = 1024
@@ -212,17 +194,15 @@ class SmartResponse(BaseModel):
     intent: Intent
     answer: Optional[str] = None
     analysis: Optional[str] = None
-    # rules omitted for now; we’ll enable later when you finish NLP fixes
+    # rules omitted for now
     sources: List[Dict[str, Any]] = []
 
 class IntentChoice(BaseModel):
     intent: Intent
 
-	
-# ----------------------------
+# -----------------------------------------------------------------------------
 # Auth dependency
-# ----------------------------
-
+# -----------------------------------------------------------------------------
 def check_auth(authorization: Optional[str] = Header(None)):
     if AUTH_TOKEN:
         if not authorization or not authorization.startswith("Bearer "):
@@ -231,12 +211,11 @@ def check_auth(authorization: Optional[str] = Header(None)):
         if token != AUTH_TOKEN:
             raise HTTPException(status_code=403, detail="Forbidden")
 
-# ----------------------------
+# -----------------------------------------------------------------------------
 # Utils
-# ----------------------------
-
+# -----------------------------------------------------------------------------
 def stable_id(text: str, metadata: Optional[Metadata]) -> str:
-    base = (text or "") + "|" + (metadata.source_type if metadata and metadata.source_type else "")
+    base = (text or "") + "\n" + (metadata.source_type if metadata and metadata.source_type else "")
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
@@ -252,25 +231,17 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     return chunks
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    model = genai.embed_content(model=EMBED_MODEL, content=texts, task_type="retrieval_document")
-    if "embeddings" in model:
-        return [e["values"] for e in model["embeddings"]]
-    elif "embedding" in model:
-        return [model["embedding"]]
-    else:
-        try:
-            return [e.values for e in model.embeddings]
-        except Exception:
-            raise HTTPException(status_code=500, detail="Unexpected embedding response format")
+    """Batch embeddings via google-genai."""
+    if not texts:
+        return []
+    result = genai_client.models.embed_content(model=EMBED_MODEL, contents=texts)
+    # result.embeddings is a list; each item has .values
+    return [emb.values for emb in result.embeddings]
 
 def embed_query(text: str) -> List[float]:
-    model = genai.embed_content(model=EMBED_MODEL, content=text, task_type="retrieval_query")
-    if "embedding" in model:
-        return model["embedding"]
-    try:
-        return model.embedding
-    except Exception:
-        raise HTTPException(status_code=500, detail="Unexpected embedding response format")
+    """Single query embedding via google-genai."""
+    result = genai_client.models.embed_content(model=EMBED_MODEL, contents=[text])
+    return result.embeddings[0].values
 
 def build_filter(filters: Optional[Dict[str, Any]]) -> Optional[Filter]:
     if not filters:
@@ -280,21 +251,10 @@ def build_filter(filters: Optional[Dict[str, Any]]) -> Optional[Filter]:
         conditions.append(FieldCondition(key=f"metadata.{k}", match=MatchValue(value=v)))
     return Filter(should=conditions) if conditions else None
 
-def cite_block(points: List[PointStruct]) -> str:
-    lines = []
-    for p in points:
-        meta = p.payload.get("metadata", {})
-        label = meta.get("source_type", "doc")
-        name = meta.get("source_name", "")
-        path = meta.get("path_or_table", "")
-        lines.append(f"- [{label}] {name} {path}".strip())
-    return "\n".join(lines)
-
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 def rule_to_text(rule: RuleModel) -> str:
-    # Human-readable summary used for indexing
     pt = rule.predicate.type
     expr = rule.predicate.expr or ""
     params = rule.predicate.params or {}
@@ -314,16 +274,16 @@ def gen_rule_id() -> str:
     return "rule_" + uuid.uuid4().hex[:12]
 
 def sanitize_filename(name: str) -> str:
-    return "".join([c if c.isalnum() or c in ['_', '-', '.'] else '_' for c in name])[:80]
+    return "".join([c if c.isalnum() or c in ['_', '-', '.'] else '_' for c in (name or "")])[:80]
 
-# ----------------------------
-# NLP parsing
-# ----------------------------
+def _strip_code_fences(text: str) -> str:
+    """Safely remove ```json ... ``` fences."""
+    return re.sub(r'^\s*```(?:json)?\s*|\s*```\s*$', '', (text or "").strip(), flags=re.IGNORECASE)
 
+# -----------------------------------------------------------------------------
+# NLP parsing — updated to new SDK (still plain JSON parsing)
+# -----------------------------------------------------------------------------
 def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
-    """
-    Use Gemini to parse req.text into structured rules constrained to ALLOWED_TYPES.
-    """
     schema_cols = ", ".join([f"{c.name}:{c.dtype}" for c in req.schema.columns])
     prompt = (
         "You are a Data Quality rule generator. Convert the user's natural language into a JSON array of rules. "
@@ -336,35 +296,20 @@ def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
         f"User text:\n{req.text}\n\n"
         "Rules JSON:"
     )
-
-    model = genai.GenerativeModel(GEN_MODEL)
-    resp = model.generate_content(
-        prompt,
-        generation_config={"max_output_tokens": 1024, "temperature": 0.1},
-        safety_settings=[
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        ]
+    resp = genai_client.models.generate_content(
+        model=GEN_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(max_output_tokens=1024, temperature=0.1),
     )
-
-    text = ""
-    if hasattr(resp, "text") and resp.text:
-        text = resp.text
-    elif resp.candidates and resp.candidates[0].content and hasattr(resp.candidates[0].content, "parts"):
-        text = "".join([getattr(p, "text", "") for p in resp.candidates[0].content.parts])
-
+    text = getattr(resp, "text", "") or ""
+    if not text and getattr(resp, "candidates", None):
+        cand = resp.candidates[0]
+        if getattr(cand, "content", None) and getattr(cand.content, "parts", None):
+            text = "".join(getattr(p, "text", "") for p in cand.content.parts if hasattr(p, "text"))
     if not text:
         raise HTTPException(status_code=500, detail="Model returned no rules")
-
     try:
-        # Some models might wrap in code fences; strip if present
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-            # remove possible "json" tag
-            cleaned = cleaned.replace("json", "", 1).strip()
+        cleaned = _strip_code_fences(text)
         raw_rules = json.loads(cleaned)
         if not isinstance(raw_rules, list):
             raise ValueError("Expected a JSON array of rules")
@@ -374,28 +319,23 @@ def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
     rules: List[RuleModel] = []
     for r in raw_rules:
         try:
-            # Fill in target dataset from schema; enforce alias/table
             target = r.get("target", {}) or {}
             target.setdefault("dataset_alias", req.schema.dataset_alias)
             target.setdefault("path_or_table", req.schema.path_or_table)
 
-            # Generate id, timestamps, metadata
             rid = gen_rule_id()
             created_at = now_iso()
             warnings = r.get("warnings", []) or []
 
-            # Validate column presence
             col = target.get("column")
             if col and col not in req.schema.column_names:
                 warnings.append(f"Column '{col}' not found in schema; please fix.")
 
-            # Validate type
-            pred = r.get("predicate", {})
+            pred = r.get("predicate", {}) or {}
             ptype = pred.get("type")
             if ptype not in ALLOWED_TYPES:
                 warnings.append(f"Unsupported type '{ptype}'. Allowed: {ALLOWED_TYPES}")
 
-            # Construct RuleModel (pydantic will enforce severity/type)
             rule = RuleModel(
                 id=rid,
                 name=r.get("name") or f"{ptype or 'rule'}_{col or 'dataset'}",
@@ -417,16 +357,18 @@ def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
             )
             rules.append(rule)
         except Exception as e:
-            # Skip unparseable rule, but continue
             raise HTTPException(status_code=400, detail=f"Rule validation error: {e}")
-
     return rules
 
 def save_rule_to_disk(rule: RuleModel) -> str:
     fname = sanitize_filename(rule.name or rule.id) + ".json"
     fpath = os.path.join(DW_RULE_DIR, fname)
     payload = rule.dict()
-    payload["metadata"] = {"source_type": "dw_rules", "path_or_table": rule.target.path_or_table, "source_name": rule.name}
+    payload["metadata"] = {
+        "source_type": "dw_rules",
+        "path_or_table": rule.target.path_or_table,
+        "source_name": rule.name
+    }
     with open(fpath, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     return fpath
@@ -462,13 +404,11 @@ def index_rule_in_qdrant(rule: RuleModel):
         ]
     )
 
-# ----------------------------
-# App
-# ----------------------------
+# -----------------------------------------------------------------------------
+# FastAPI app & endpoints
+# -----------------------------------------------------------------------------
+app = FastAPI(title="DQ Relay", version="1.2.0")
 
-app = FastAPI(title="DQ Relay", version="1.1.0")
-
-# CORS
 origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -481,7 +421,7 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     client = get_qdrant()
-    # Assume text-embedding-004 has dim 768
+    # text-embedding-004 => 768 dims; if you use gemini-embedding-001, raise dim
     ensure_collection(client, dim=768)
 
 @app.get("/health")
@@ -495,27 +435,22 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
     for item in payload.items:
         md = item.metadata or Metadata()
         md.timestamp = md.timestamp or time.time()
-
         chunks = chunk_text(item.text, payload.chunk_size, payload.chunk_overlap)
         vectors = embed_texts(chunks)
-
-        for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
+        for chunk, vec in zip(chunks, vectors):
             pid = item.id or str(uuid.uuid4())
-            flat_vec = vec[0] if isinstance(vec, list) and isinstance(vec[0], list) else vec
             points.append(
                 PointStruct(
                     id=pid,
-                    vector={"default": flat_vec},
+                    vector={"default": vec},
                     payload={
                         "text": chunk,
                         "metadata": md.dict(exclude_none=True),
                     },
                 )
             )
-
     if not points:
         raise HTTPException(status_code=400, detail="No content to upsert")
-
     client.upsert(collection_name=QDRANT_COLLECTION, points=points)
     return {"upserted": len(points)}
 
@@ -523,7 +458,6 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
 def chat(req: ChatRequest, _: None = Depends(check_auth)):
     client = get_qdrant()
     qvec = embed_query(req.query)
-
     q_filter = build_filter(req.filters)
     results = client.search(
         collection_name=QDRANT_COLLECTION,
@@ -533,7 +467,6 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         score_threshold=None,
         query_filter=q_filter,
     )
-
     sources = []
     for r in results:
         meta = r.payload.get("metadata", {})
@@ -550,37 +483,34 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         "Prefer precise references to rules, profile fields, and execution outcomes."
     )
     context_block = "\n\n---\n\n".join(
-        f"[{r.payload.get('metadata', {}).get('source_type','doc')}] {r.payload.get('metadata', {}).get('source_name','')} {r.payload.get('metadata', {}).get('path_or_table','')}\n{r.payload.get('text','')}"
+        f"[{r.payload.get('metadata', {}).get('source_type','doc')}] "
+        f"{r.payload.get('metadata', {}).get('source_name','')} "
+        f"{r.payload.get('metadata', {}).get('path_or_table','')}\n"
+        f"{r.payload.get('text','')}"
         for r in results
     ) if results else "No context."
-    user_prompt = f"{system_prompt}\n\nContext:\n{context_block}\n\nUser question:\n{req.query}\n\nWhen you cite or refer, mention the source_type or rule names if present."
 
-    model = genai.GenerativeModel(GEN_MODEL)
-    resp = model.generate_content(
-        user_prompt,
-        generation_config={
-            "max_output_tokens": req.max_output_tokens,
-            "temperature": req.temperature,
-        },
-        safety_settings=[
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        ]
+    user_prompt = (
+        f"{system_prompt}\n\nContext:\n{context_block}\n\nUser question:\n{req.query}\n\n"
+        "When you cite or refer, mention the source_type or rule names if present."
     )
 
-    answer = ""
-    if resp.candidates:
+    resp = genai_client.models.generate_content(
+        model=GEN_MODEL,
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            max_output_tokens=req.max_output_tokens,
+            temperature=req.temperature
+        )
+    )
+    answer = getattr(resp, "text", "") or ""
+    if not answer and getattr(resp, "candidates", None):
         cand = resp.candidates[0]
-        if cand.finish_reason == "SAFETY":
-            answer = "?? Response blocked by Gemini safety filters."
-        elif getattr(cand, "content", None) and getattr(cand.content, "parts", None):
+        if getattr(cand, "content", None) and getattr(cand.content, "parts", None):
             answer = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
 
     if not answer:
         answer = "I don't have sufficient indexed context to answer that yet. Please load your reports or rules via /upsert_batch."
-
     return ChatResponse(answer=answer, sources=sources)
 
 @app.post("/recommend", response_model=RecommendationResponse)
@@ -591,53 +521,32 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
         "validation rules, and cleansing strategies. "
         "Be precise, actionable, and structured."
     )
-
     user_prompt = f"{system_prompt}\n\nProfile Summary:\n{req.profile_summary}\n\nRecommendations:"
-
-    model = genai.GenerativeModel("gemini-2.5-flash")
-    resp = model.generate_content(
-        user_prompt,
-        generation_config={
-            "max_output_tokens": req.max_output_tokens,
-            "temperature": req.temperature,
-        },
-        safety_settings=[
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        ]
+    resp = genai_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            max_output_tokens=req.max_output_tokens,
+            temperature=req.temperature
+        )
     )
-    answer = ""
-    try:
-        if hasattr(resp, "text") and resp.text:
-            answer = resp.text
-        elif resp.candidates:
-            cand = resp.candidates[0]
-            if cand.finish_reason == "SAFETY":
-                answer = "Response blocked by Gemini safety filters."
-            elif hasattr(cand, "content") and cand.content:
-                if hasattr(cand.content, "parts"):
-                    texts = [getattr(p, "text", "") for p in cand.content.parts]
-                    answer = "".join([t for t in texts if t])
-                elif isinstance(cand.content, str):
-                    answer = cand.content
-                elif isinstance(cand.content, dict) and "parts" in cand.content:
-                    texts = [p.get("text", "") for p in cand.content["parts"]]
-                    answer = "".join([t for t in texts if t])
-    except Exception as e:
-        print("Error extracting Gemini response:", e)
-
+    answer = getattr(resp, "text", "") or ""
+    if not answer and getattr(resp, "candidates", None):
+        cand = resp.candidates[0]
+        if getattr(cand, "content", None):
+            if getattr(cand.content, "parts", None):
+                texts = [getattr(p, "text", "") for p in cand.content.parts]
+                answer = "".join([t for t in texts if t])
+            elif isinstance(cand.content, str):
+                answer = cand.content
     if not answer:
         answer = "Gemini returned no usable text. Please check profile summary formatting."
-
     return RecommendationResponse(recommendations=answer)
 
 @app.post("/analytics", response_model=AnalyticsResponse)
 def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     client = get_qdrant()
     qvec = embed_query(req.query)
-
     q_filter = build_filter(req.filters)
     results = client.search(
         collection_name=QDRANT_COLLECTION,
@@ -647,7 +556,6 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
         score_threshold=None,
         query_filter=q_filter,
     )
-
     sources = []
     for r in results:
         meta = r.payload.get("metadata", {})
@@ -666,90 +574,67 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
         "If the answer is not in the context, say you do not have that information."
     )
     context_block = "\n\n---\n\n".join(
-        f"[{r.payload.get('metadata', {}).get('source_type','doc')}] {r.payload.get('metadata', {}).get('source_name','')} {r.payload.get('metadata', {}).get('path_or_table','')}\n{r.payload.get('text','')}"
+        f"[{r.payload.get('metadata', {}).get('source_type','doc')}] "
+        f"{r.payload.get('metadata', {}).get('source_name','')} "
+        f"{r.payload.get('metadata', {}).get('path_or_table','')}\n"
+        f"{r.payload.get('text','')}"
         for r in results
     ) if results else "No context."
-    user_prompt = f"{system_prompt}\n\nContext:\n{context_block}\n\nAnalytics Question:\n{req.query}\n\nProvide structured insights."
-
-    model = genai.GenerativeModel("gemini-2.5-flash")
-    resp = model.generate_content(
-        user_prompt,
-        generation_config={
-            "max_output_tokens": req.max_output_tokens,
-            "temperature": req.temperature,
-        },
-        safety_settings=[
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        ]
+    user_prompt = (
+        f"{system_prompt}\n\nContext:\n{context_block}\n\nAnalytics Question:\n{req.query}\n\nProvide structured insights."
     )
 
-    analysis = ""
-    if resp and getattr(resp, "candidates", None):
+    resp = genai_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            max_output_tokens=req.max_output_tokens,
+            temperature=req.temperature
+        )
+    )
+    analysis = getattr(resp, "text", "") or ""
+    if not analysis and getattr(resp, "candidates", None):
         cand = resp.candidates[0]
-        if cand.finish_reason == "SAFETY":
-            analysis = "Response blocked by Gemini safety filters."
-        elif hasattr(cand, "content") and cand.content:
-            if hasattr(cand.content, "parts"):
-                texts = [getattr(p, "text", "") for p in cand.content.parts]
-                analysis = "".join([t for t in texts if t])
-            elif isinstance(cand.content, str):
-                analysis = cand.content
-
+        if getattr(cand, "content", None) and getattr(cand.content, "parts", None):
+            texts = [getattr(p, "text", "") for p in cand.content.parts]
+            analysis = "".join([t for t in texts if t])
+        elif isinstance(cand.content, str):
+            analysis = cand.content
     if not analysis:
         analysis = "No analytics could be generated from the current context."
-
     return AnalyticsResponse(analysis=analysis, sources=sources)
-
-# ----------------------------
-# NEW: NLP Rule Create Endpoint
-# ----------------------------
 
 @app.post("/nlp_rule_create", response_model=List[RuleModel])
 def nlp_rule_create(req: NlpRuleCreateRequest, _: None = Depends(check_auth)):
-    # 1) Parse rules from NL using Gemini
     rules = parse_rules_with_gemini(req)
-
-    # 2) Validate against schema columns and attach warnings already handled in parse
-    # 3) Save each rule under <PROJ_ROOT>/dw/rule/*.json
     for i, rule in enumerate(rules):
         fpath = save_rule_to_disk(rule)
         rules[i].source_path = fpath
-
-        # 4) Index in Qdrant with metadata.source_type="dw_rules"
         try:
             index_rule_in_qdrant(rule)
         except Exception as e:
-            # Keep rule but add warning
             w = rules[i].warnings or []
             w.append(f"Indexing failed: {e}")
             rules[i].warnings = w
-
-    # 5) Optionally auto-commit (already persisted to disk + indexed)
-    # Nothing else needed server-side; client can toggle active via /upsert_batch if desired.
     return rules
 
-	
-
+# -----------------------------------------------------------------------------
+# Smart endpoint: Structured Outputs intent + delegation
+# -----------------------------------------------------------------------------
 def _classify_intent_structured(query: str) -> Intent:
-    if GENAI_MODE == "google-genai":
-        try:
-            client = genai_sdk.Client()  # picks GEMINI_API_KEY / GOOGLE_API_KEY
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=f"Classify into intent (chat|analytics|rule_create): {query}",
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=IntentChoice,
-                    temperature=0.0
-                )
+    try:
+        resp = genai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"Classify into intent (chat|analytics|rule_create): {query}",
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=IntentChoice,
+                temperature=0.0
             )
-            return resp.parsed.intent
-        except Exception:
-            pass
-        # Fallback heuristic (deterministic)
+        )
+        return resp.parsed.intent
+    except Exception:
+        # fallback heuristics
         q = (query or "").lower()
         if ("create rule" in q) or ("define rule" in q):
             return Intent.rule_create
@@ -765,23 +650,11 @@ def _classify_intent_structured(query: str) -> Intent:
             return Intent.analytics
         return Intent.chat
 
-
-
-
-
-
 @app.post("/smart", response_model=SmartResponse)
 def smart(req: SmartRequest, _: None = Depends(check_auth)):
-    """
-    Server-side smart router:
-    - Classifies intent robustly (Structured Outputs + fallback)
-    - Delegates to existing /chat or /analytics handler functions
-    - For now, rule_create intent returns a guidance message
-    """
     intent = _classify_intent_structured(req.query)
 
     if intent == Intent.chat:
-        # Call your existing handler function directly
         resp = chat(ChatRequest(
             query=req.query,
             top_k=max(1, req.top_k),
@@ -801,10 +674,9 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
         ))
         return SmartResponse(intent=intent, analysis=resp.analysis, sources=resp.sources)
 
-    # rule_create – disabled in client for now
-    # (We’ll enable returning rules after you validate and we harden NLP parsing)
+    # For now, we return guidance for rule_create (UI path disabled)
     return SmartResponse(
         intent=intent,
-        answer="Relay classified this as 'rule_create'. Rule creation is temporarily disabled in the client.",
+        answer="Intent classified as 'rule_create'. Client currently has rule creation disabled.",
         sources=[]
     )
