@@ -31,6 +31,17 @@ for var in REQUIRED_ENV:
     if not os.getenv(var):
         raise RuntimeError(f"Missing environment variable: {var}")
 
+		
+# Prefer the new SDK for Structured Outputs; fall back if not available
+GENAI_MODE = None
+try:
+    from google import genai as genai_sdk          # new SDK
+    from google.genai import types as genai_types
+    GENAI_MODE = "google-genai"
+except Exception:
+    GENAI_MODE = None
+	
+	
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
@@ -205,7 +216,7 @@ class SmartResponse(BaseModel):
     sources: List[Dict[str, Any]] = []
 
 class IntentChoice(BaseModel):
-    intent: Intent = Field(description="One of: chat | analytics | rule_create")
+    intent: Intent
 
 	
 # ----------------------------
@@ -723,22 +734,21 @@ def nlp_rule_create(req: NlpRuleCreateRequest, _: None = Depends(check_auth)):
 	
 
 def _classify_intent_structured(query: str) -> Intent:
-    """
-    Use Gemini Structured Outputs to return a valid JSON object with an 'intent' field.
-    Falls back to heuristics if SDK errors.
-    """
-    try:
-        resp = genai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=f"Classify the user's message into one of: chat, analytics, rule_create.\n\nUser: {query}",
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=IntentChoice,   # <- guarantees JSON shape
-                temperature=0.0
+    if GENAI_MODE == "google-genai":
+        try:
+            client = genai_sdk.Client()  # picks GEMINI_API_KEY / GOOGLE_API_KEY
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=f"Classify into intent (chat|analytics|rule_create): {query}",
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=IntentChoice,
+                    temperature=0.0
+                )
             )
-        )
-        return resp.parsed.intent
-    except Exception:
+            return resp.parsed.intent
+        except Exception:
+            pass
         # Fallback heuristic (deterministic)
         q = (query or "").lower()
         if ("create rule" in q) or ("define rule" in q):
