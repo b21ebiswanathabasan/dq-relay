@@ -1,5 +1,6 @@
 ﻿
-# DQ Relay (FastAPI) � unified on google-genai
+# DQ Relay (FastAPI) unified on google-genai — UPDATED (11-Nov-2025)
+
 import os
 import time
 import hashlib
@@ -7,17 +8,16 @@ import uuid
 import json
 import re
 from functools import lru_cache
-
-from pydantic import BaseModel, Field, ValidationError
-from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
-import re
-from dateutil.parser import parse as dt_parse  # add python-dateutil to requirements if not present
 from typing import List, Optional, Dict, Any
 from enum import Enum
 
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
+
+from pydantic import BaseModel, Field, validator
+
+from dateutil.parser import parse as dt_parse  # ensure python-dateutil in requirements
 
 # NEW SDK (one SDK for gen content + structured outputs + embeddings)
 from google import genai
@@ -28,9 +28,9 @@ from qdrant_client.http.models import (
     Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 )
 
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 # Env & configuration
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 REQUIRED_ENV = [
     "GEMINI_API_KEY",
     "QDRANT_URL",
@@ -46,9 +46,8 @@ QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "dq_docs")
 
-# Default embedding model: 768 dims � matches Qdrant dim below
+# Default embedding model: 768 dims — matches Qdrant dim below
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-004")
-
 # Default gen model for text answers
 GEN_MODEL = os.getenv("GEN_MODEL", "gemini-2.5-flash")
 
@@ -63,9 +62,10 @@ os.makedirs(DW_RULE_DIR, exist_ok=True)
 # One client for all operations
 genai_client = genai.Client()  # auto picks GEMINI_API_KEY / GOOGLE_API_KEY
 
-# -----------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------
 # Qdrant client
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def get_qdrant() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -79,9 +79,9 @@ def ensure_collection(client: QdrantClient, dim: int = 768):
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
         )
 
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 # Schemas
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 class Metadata(BaseModel):
     source_type: Optional[str] = Field(None, description="e.g., profile_report, dq_rules, dq_run_report")
     source_name: Optional[str] = None
@@ -140,6 +140,7 @@ class SchemaInput(BaseModel):
     dataset_alias: str
     path_or_table: str
     columns: List[SchemaColumn]
+
     @property
     def column_names(self) -> List[str]:
         return [c.name for c in self.columns]
@@ -148,6 +149,7 @@ class Predicate(BaseModel):
     type: str
     expr: Optional[str] = None
     params: Optional[Dict[str, Any]] = None
+
     @validator('type')
     def check_type(cls, v):
         if v not in ALLOWED_TYPES:
@@ -170,6 +172,7 @@ class RuleModel(BaseModel):
     created_at: Optional[str] = None
     source_path: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
     @validator('severity')
     def check_severity(cls, v):
         if v not in ['info', 'warn', 'error']:
@@ -205,9 +208,7 @@ class SmartResponse(BaseModel):
 class IntentChoice(BaseModel):
     intent: Intent
 
-# ----------------------------
 # Models to match your UI
-# ----------------------------
 class Operator(str, Enum):
     contains = "contains"
     is_ = "is"
@@ -239,23 +240,22 @@ class Statement(BaseModel):
 class InputColumn(BaseModel):
     name: str
     description: Optional[str] = None
-    data_type: str = "String"        # "String" | "Integer" | "Float" | "Date/Time"
+    data_type: str = "String"  # "String" | "Integer" | "Float" | "Date/Time"
     max_length: Optional[str] = ""
 
 class RuleMapResponse(BaseModel):
     rule_name: Optional[str] = None
     rule_details: Optional[str] = None
     inputs: List[InputColumn]
-    groups: List[List[Statement]]     # same shape as Streamlit Rule Builder
+    groups: List[List[Statement]]  # same shape as Streamlit Rule Builder
 
 class NlpRuleMapRequest(BaseModel):
     text: str
-    schema: Dict[str, Any]            # Expected shape of your SchemaInput
+    schema: Dict[str, Any]  # Expected shape of your SchemaInput
 
-
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 # Auth dependency
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 def check_auth(authorization: Optional[str] = Header(None)):
     if AUTH_TOKEN:
         if not authorization or not authorization.startswith("Bearer "):
@@ -264,9 +264,9 @@ def check_auth(authorization: Optional[str] = Header(None)):
         if token != AUTH_TOKEN:
             raise HTTPException(status_code=403, detail="Forbidden")
 
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 # Utils
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 def stable_id(text: str, metadata: Optional[Metadata]) -> str:
     base = (text or "") + "\n" + (metadata.source_type if metadata and metadata.source_type else "")
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
@@ -329,13 +329,14 @@ def gen_rule_id() -> str:
 def sanitize_filename(name: str) -> str:
     return "".join([c if c.isalnum() or c in ['_', '-', '.'] else '_' for c in (name or "")])[:80]
 
+# --- UPDATED: safer fence stripper ---
 def _strip_code_fences(text: str) -> str:
-    """Safely remove ```json ... ``` fences."""
-    return re.sub(r'^\s*```(?:json)?\s*|\s*```\s*$', '', (text or "").strip(), flags=re.IGNORECASE)
+    t = (text or "").strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```$", "", t)
+    return t.strip()
 
-# ----------------------------
-# Helpers (synonyms & dtype inference)
-# ----------------------------
+# Operator synonyms
 _OP_SYNONYMS = {
     "equals": "is",
     "==": "is",
@@ -354,18 +355,17 @@ def _norm_op(txt: str) -> str:
     return _OP_SYNONYMS.get(t, t)
 
 def _is_iso_date(s: str) -> bool:
-    # Lightweight date heuristic (avoid extra dependencies)
+    # Lightweight date heuristic (yyyy-mm-dd or yyyy/mm/dd)
     s = (s or "").strip()
-    # yyyy-mm-dd or yyyy/mm/dd; extend as needed
     return bool(re.fullmatch(r"\d{4}[-/]\d{2}[-/]\d{2}", s))
 
 def _infer_numeric_type(s: str) -> Optional[str]:
     val = (s or "").strip()
     # strictly integer?
-    if re.fullmatch(r"[+-]?\d+", val):
+    if re.fullmatch(r"[+\-]?\d+", val):
         return "integer value"
     # float?
-    if re.fullmatch(r"[+-]?\d+\.\d+", val):
+    if re.fullmatch(r"[+\-]?\d+\.\d+", val):
         return "float value"
     return None
 
@@ -383,10 +383,21 @@ def _infer_list_dtype_hint(values: List[str]) -> str:
         votes[_infer_scalar_dtype_hint(v)] += 1
     return max(votes, key=votes.get) if votes else "String"
 
+# --- UPDATED: simpler comma splitter ---
 def _split_list(raw: str) -> List[str]:
     s = (raw or "").strip().strip("{}")
-    items = [i.strip() for i in re.split(r"[,\|]", s) if i.strip()]
-    return items
+    return [i.strip() for i in s.split(",") if i.strip()]
+
+# --- NEW: Condition type normalizer ---
+def _norm_condition_type(s: str) -> str:
+    t = (s or "").strip().lower()
+    if t in {"string", "text"}: t = "string value"
+    if t in {"integer", "int"}: t = "integer value"
+    if t in {"float", "double", "decimal"}: t = "float value"
+    if t in {"timestamp", "now", "today", "current time"}: t = "current timestamp"
+    if t in {"expr", "expression"}: t = "expression"
+    if t in {"null", "none"}: t = "null value"
+    return t
 
 def _to_ui_dtype(dtype_hint: str) -> str:
     """Map our hint to Input Columns choices: String | Integer | Float | Date/Time."""
@@ -397,9 +408,9 @@ def _to_ui_dtype(dtype_hint: str) -> str:
         return "Date/Time"
     return "String"
 
-# -----------------------------------------------------------------------------
-# NLP parsing � updated to new SDK (still plain JSON parsing)
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+# NLP parsing — updated to new SDK (still plain JSON parsing for /nlp_rule_create)
+# ------------------------------------------------------------------------------------
 def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
     schema_cols = ", ".join([f"{c.name}:{c.dtype}" for c in req.schema.columns])
     prompt = (
@@ -425,6 +436,7 @@ def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
             text = "".join(getattr(p, "text", "") for p in cand.content.parts if hasattr(p, "text"))
     if not text:
         raise HTTPException(status_code=500, detail="Model returned no rules")
+
     try:
         cleaned = _strip_code_fences(text)
         raw_rules = json.loads(cleaned)
@@ -439,20 +451,16 @@ def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
             target = r.get("target", {}) or {}
             target.setdefault("dataset_alias", req.schema.dataset_alias)
             target.setdefault("path_or_table", req.schema.path_or_table)
-
             rid = gen_rule_id()
             created_at = now_iso()
             warnings = r.get("warnings", []) or []
-
             col = target.get("column")
             if col and col not in req.schema.column_names:
                 warnings.append(f"Column '{col}' not found in schema; please fix.")
-
             pred = r.get("predicate", {}) or {}
             ptype = pred.get("type")
             if ptype not in ALLOWED_TYPES:
                 warnings.append(f"Unsupported type '{ptype}'. Allowed: {ALLOWED_TYPES}")
-
             rule = RuleModel(
                 id=rid,
                 name=r.get("name") or f"{ptype or 'rule'}_{col or 'dataset'}",
@@ -521,10 +529,10 @@ def index_rule_in_qdrant(rule: RuleModel):
         ]
     )
 
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 # FastAPI app & endpoints
-# -----------------------------------------------------------------------------
-app = FastAPI(title="DQ Relay", version="1.2.0")
+# ------------------------------------------------------------------------------------
+app = FastAPI(title="DQ Relay", version="1.3.0")
 
 origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
@@ -593,7 +601,6 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
             "source_name": meta.get("source_name"),
             "path_or_table": meta.get("path_or_table"),
         })
-
     system_prompt = (
         "You are a data quality assistant. Answer using only the provided context. "
         "If the answer is not in context, say you do not have that information. "
@@ -606,12 +613,10 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         f"{r.payload.get('text','')}"
         for r in results
     ) if results else "No context."
-
     user_prompt = (
         f"{system_prompt}\n\nContext:\n{context_block}\n\nUser question:\n{req.query}\n\n"
         "When you cite or refer, mention the source_type or rule names if present."
     )
-
     resp = genai_client.models.generate_content(
         model=GEN_MODEL,
         contents=user_prompt,
@@ -625,7 +630,6 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         cand = resp.candidates[0]
         if getattr(cand, "content", None) and getattr(cand.content, "parts", None):
             answer = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
-
     if not answer:
         answer = "I don't have sufficient indexed context to answer that yet. Please load your reports or rules via /upsert_batch."
     return ChatResponse(answer=answer, sources=sources)
@@ -682,7 +686,6 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
             "source_name": meta.get("source_name"),
             "path_or_table": meta.get("path_or_table"),
         })
-
     system_prompt = (
         "You are a Data Quality analytics assistant. "
         "Given context from data quality rules, profile reports, and cleansing runs, "
@@ -700,7 +703,6 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     user_prompt = (
         f"{system_prompt}\n\nContext:\n{context_block}\n\nAnalytics Question:\n{req.query}\n\nProvide structured insights."
     )
-
     resp = genai_client.models.generate_content(
         model="gemini-2.5-flash",
         contents=user_prompt,
@@ -735,9 +737,9 @@ def nlp_rule_create(req: NlpRuleCreateRequest, _: None = Depends(check_auth)):
             rules[i].warnings = w
     return rules
 
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 # Smart endpoint: Structured Outputs intent + delegation
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
 def _classify_intent_structured(query: str) -> Intent:
     try:
         resp = genai_client.models.generate_content(
@@ -760,9 +762,9 @@ def _classify_intent_structured(query: str) -> Intent:
                       ">", "<", "=", "!=", "satisfies"]
         if any(w in q for w in rule_words):
             return Intent.rule_create
-        analytics_words = ["top ","trend","last week","last month","last 3 months",
-                           "distribution","aggregate","summary","count of failures",
-                           "most missing","percent null","grouped by","failed rules"]
+        analytics_words = ["top ", "trend", "last week", "last month", "last 3 months",
+                           "distribution", "aggregate", "summary", "count of failures",
+                           "most missing", "percent null", "grouped by", "failed rules"]
         if any(w in q for w in analytics_words) or q.startswith("top "):
             return Intent.analytics
         return Intent.chat
@@ -770,7 +772,6 @@ def _classify_intent_structured(query: str) -> Intent:
 @app.post("/smart", response_model=SmartResponse)
 def smart(req: SmartRequest, _: None = Depends(check_auth)):
     intent = _classify_intent_structured(req.query)
-
     if intent == Intent.chat:
         resp = chat(ChatRequest(
             query=req.query,
@@ -780,7 +781,6 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
             max_output_tokens=req.max_output_tokens
         ))
         return SmartResponse(intent=intent, answer=resp.answer, sources=resp.sources)
-
     if intent == Intent.analytics:
         resp = analytics(AnalyticsRequest(
             query=req.query,
@@ -790,7 +790,6 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
             max_output_tokens=req.max_output_tokens
         ))
         return SmartResponse(intent=intent, analysis=resp.analysis, sources=resp.sources)
-
     # For now, we return guidance for rule_create (UI path disabled)
     return SmartResponse(
         intent=intent,
@@ -798,131 +797,264 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
         sources=[]
     )
 
-# ----------------------------
-# The endpoint
-# ----------------------------
+# ------------------------------------------------------------------------------------
+# The endpoint — UPDATED with robust fallback and normalizers
+# ------------------------------------------------------------------------------------
 @app.post("/nlp_rule_map", response_model=RuleMapResponse)
 def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
+    """
+    Convert NL into UI-ready Rule Builder groups & inferred Input Columns.
+    - Structured Outputs ensure valid JSON structure.
+    - Post-normalization enforces: 'between' -> >= and <=, 'is within' -> function list, etc.
+    """
     try:
-        text = (req.text or "").strip()
-        schema_cols = req.schema.get("columns", [])
-        schema_cols_str = ", ".join([f"{c.get('name')}:{c.get('dtype','')}" for c in schema_cols if c.get("name")])
+        text: str = (req.text or "").strip()
+        schema_dict: Dict[str, Any] = req.schema or {}
+        # Extract schema columns if provided
+        columns_in_schema: List[Dict[str, Any]] = schema_dict.get("columns", [])
+        schema_cols_str = ", ".join(
+            [f"{c.get('name')}: {c.get('dtype','')}" for c in columns_in_schema if c.get("name")]
+        )
 
+        # Valid operator list matching your constants.OPERATORS
         operator_list = [
             "contains", "is", "is not", "is within", "is not within",
             "is less than", "is less than or equal to",
             "is greater than", "is greater than or equal to",
         ]
+
+        # Valid condition types per operator matching constants.CONDITION_TYPES_MAP
+        cond_types_map = {
+            "contains": ["string value"],
+            "is": ["null value","string value","integer value","float value","current timestamp","expression"],
+            "is not": ["null value","string value","integer value","float value","current timestamp","expression"],
+            "is within": ["function"],
+            "is not within": ["function"],
+            "is less than": ["integer value","float value","expression"],
+            "is less than or equal to": ["integer value","float value","expression"],
+            "is greater than": ["integer value","float value","expression"],
+            "is greater than or equal to": ["integer value","float value","expression"],
+        }
+
+        # Prompt with strict instructions for the model — UPDATED hygiene
         prompt = (
-            "Convert natural language DQ requirements into Rule Builder statements.\n"
+            "You convert natural language DQ requirements into Rule Builder statements.\n"
             f"Valid operators: {operator_list}\n"
-            "Condition_Type must be allowed for the chosen operator.\n"
-            "ANDs go into a single group; new group == OR.\n"
-            "‘between A and B’ MUST become = A and = B on the same column.\n"
-            "‘in {a,b,c}’, ‘one of’, ‘is within’ => operator 'is within' and Condition_Type 'function'; "
-            "‘not in’ => 'is not within'.\n"
-            "Use EXACT schema column names where applicable (do not invent columns).\n"
-            "Include optional rule_name and rule_details if obvious; otherwise leave empty.\n\n"
+            "Condition_Type must be one of the allowed types for the chosen operator.\n"
+            "Rules:\n"
+            " - Use AND inside a group; start a new group for OR.\n"
+            " - 'between A and B' MUST become two statements on the same Column:\n"
+            "   one with 'is greater than or equal to' A, and one with 'is less than or equal to' B.\n"
+            " - 'in {a,b,c}', 'one of', 'is within' map to operator 'is within' and Condition_Type 'function'.\n"
+            " - 'not in' -> 'is not within'.\n"
+            " - 'equals' -> 'is'; 'not equals' -> 'is not'; symbols (>,>=,<,<=) map to the corresponding operators.\n"
+            " - Use the EXACT column names given in schema—do not invent columns.\n"
+            " - For list values, keep them as a comma-separated string in Condition_Value (e.g., \"A, B, C\").\n"
+            " - Include rule_name and rule_details if implied by the text; else leave them empty.\n"
+            " - Return ONLY JSON, no markdown, no comments, no trailing commas; keys/strings must use double-quotes.\n\n"
             f"Schema columns: [{schema_cols_str}]\n\n"
             f"User input:\n{text}\n\n"
-            "Return JSON matching: { rule_name?, rule_details?, inputs?, groups? }."
+            "Produce JSON matching RuleMapResponse."
         )
 
-        # 1) Try Structured Outputs
-        try:
-            so = genai_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=RuleMapResponse,
-                    temperature=0.0, max_output_tokens=1024
-                )
+        # --- Structured Outputs call with robust fallback ---
+        resp = genai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=RuleMapResponse,  # parsed Pydantic object
+                temperature=0.0,
+                max_output_tokens=1024
             )
-            parsed: RuleMapResponse = so.parsed
-            raw_groups = [ [ s.model_dump() for s in group ] for group in parsed.groups ]
-            groups = _normalize_groups(raw_groups)
-            # build inputs from groups (prefer stronger types if repeated)
-            seen: Dict[str, InputColumn] = {}
-            rank = {"Date/Time":3, "Float":2, "Integer":2, "String":1}
-            for g in groups:
-                for s in g:
-                    col = (s.Column or "").strip()
-                    if not col:
-                        continue
-                    hint = s.DType or "String"
-                    dtype = _to_ui_dtype(hint)
-                    cur = seen.get(col)
-                    if not cur:
-                        seen[col] = InputColumn(name=col, data_type=dtype, description="", max_length="")
-                    else:
-                        if rank.get(dtype,1) > rank.get(cur.data_type,1):
-                            cur.data_type = dtype
-            inputs = list(seen.values())
-            return RuleMapResponse(
-                rule_name=parsed.rule_name,
-                rule_details=parsed.rule_details,
-                inputs=inputs,
-                groups=groups
-            )
-        except Exception as so_err:
-            # 2) Fallback: no-schema generation, then coerce
-            ns = genai_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0, max_output_tokens=1024
-                )
-            )
-            raw_text = getattr(ns, "text", "") or ""
-            if not raw_text and getattr(ns, "candidates", None):
-                cand = ns.candidates[0]
-                if getattr(cand, "content", None) and getattr(cand.content, "parts", None):
-                    raw_text = "".join(getattr(p, "text", "") for p in cand.content.parts if hasattr(p, "text"))
-            if not raw_text:
-                raise HTTPException(status_code=400, detail="Model returned no JSON.")
-            # strip code fences if any
-            cleaned = re.sub(r'^\s*```(?:json)?\s*|\s*```\s*$', '', raw_text.strip(), flags=re.IGNORECASE)
+        )
+
+        if getattr(resp, "parsed", None) is None:
+            # Fallback: try to coerce raw text into JSON and validate against RuleMapResponse
+            raw_text = getattr(resp, "text", "") or ""
+            print("[/nlp_rule_map] structured outputs failed, raw_text:", raw_text[:500])
             try:
-                data = json.loads(cleaned)
-            except Exception as je:
-                raise HTTPException(status_code=400, detail=f"Invalid JSON from model: {je}")
+                txt = _strip_code_fences(raw_text)
+                obj = json.loads(txt)  # strict JSON
+                parsed = RuleMapResponse(**obj)  # validate with Pydantic
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid JSON from model: {e}")
+        else:
+            parsed: RuleMapResponse = resp.parsed  # Model returned structured output
 
-            # data can be missing fields; make them optional
-            rule_name    = (data.get("rule_name") or data.get("name") or "")
-            rule_details = (data.get("rule_details") or data.get("details") or "")
-            raw_groups   = data.get("groups") or data.get("statements") or []
-            groups = _normalize_groups(raw_groups)
+        # --- Post-normalization: enforce rules & infer dtypes ---
+        normalized_groups: List[List[Statement]] = []
+        for group in parsed.groups:
+            norm_group: List[Statement] = []
+            for stt in group:
+                # normalize operator synonyms/symbols if any
+                op_norm = _norm_op(stt.Operator.value if isinstance(stt.Operator, Operator) else str(stt.Operator))
+                # map string -> Operator enum
+                if op_norm == "is":
+                    op_enum = Operator.is_
+                elif op_norm == "is not":
+                    op_enum = Operator.is_not
+                elif op_norm == "is within":
+                    op_enum = Operator.is_within
+                elif op_norm == "is not within":
+                    op_enum = Operator.is_not_within
+                elif op_norm == "is less than":
+                    op_enum = Operator.is_less_than
+                elif op_norm == "is less than or equal to":
+                    op_enum = Operator.is_less_equal
+                elif op_norm == "is greater than":
+                    op_enum = Operator.is_greater_than
+                elif op_norm == "is greater than or equal to":
+                    op_enum = Operator.is_greater_equal
+                elif op_norm == "contains":
+                    op_enum = Operator.contains
+                else:
+                    op_enum = Operator.is_  # default
 
-            # build inputs
-            seen: Dict[str, InputColumn] = {}
-            rank = {"Date/Time":3, "Float":2, "Integer":2, "String":1}
-            for g in groups:
-                for s in g:
-                    col = (s.Column or "").strip()
-                    if not col:
-                        continue
-                    hint = s.DType or "String"
-                    dtype = _to_ui_dtype(hint)
-                    cur = seen.get(col)
-                    if not cur:
-                        seen[col] = InputColumn(name=col, data_type=dtype, description="", max_length="")
+                col_name = (stt.Column or "").strip()
+                cond_val = (stt.Condition_Value or "").strip()
+
+                # (1) between ? two rows (>= A, <= B) — UPDATED extractor
+                if re.search(r"\bbetween\b", cond_val, flags=re.I):
+                    m = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+)", cond_val, flags=re.I)
+                    if m:
+                        a, b = m.group(1).strip(), m.group(2).strip()
+                        hint_a = _infer_scalar_dtype_hint(a)
+                        hint_b = _infer_scalar_dtype_hint(b)
+                        # >= A row
+                        ct_a = _infer_numeric_type(a) or ("expression" if _is_iso_date(a) else "string value")
+                        norm_group.append(Statement(
+                            Column=col_name,
+                            Operator=Operator.is_greater_equal,
+                            Condition_Type=ConditionType(_norm_condition_type(ct_a)),
+                            Condition_Value=a,
+                            DType=hint_a
+                        ))
+                        # <= B row
+                        ct_b = _infer_numeric_type(b) or ("expression" if _is_iso_date(b) else "string value")
+                        norm_group.append(Statement(
+                            Column=col_name,
+                            Operator=Operator.is_less_equal,
+                            Condition_Type=ConditionType(_norm_condition_type(ct_b)),
+                            Condition_Value=b,
+                            DType=hint_b
+                        ))
+                        continue  # next statement
+
+                # (2) within / not within ? function + typed list — UPDATED splitter
+                if op_enum in (Operator.is_within, Operator.is_not_within):
+                    items = _split_list(cond_val)
+                    dtype_hint = _infer_list_dtype_hint(items) if items else "String"
+                    norm_group.append(Statement(
+                        Column=col_name,
+                        Operator=op_enum,
+                        Condition_Type=ConditionType.function,
+                        Condition_Value=", ".join(items),
+                        DType=dtype_hint
+                    ))
+                    continue
+
+                # (3) contains ? string value
+                if op_enum == Operator.contains:
+                    norm_group.append(Statement(
+                        Column=col_name,
+                        Operator=op_enum,
+                        Condition_Type=ConditionType.string_value,
+                        Condition_Value=cond_val,
+                        DType="String"
+                    ))
+                    continue
+
+                # (4) numeric/date comparisons ? pick int/float/expression
+                if op_enum in (Operator.is_less_than, Operator.is_less_equal,
+                               Operator.is_greater_than, Operator.is_greater_equal):
+                    dtype_hint = _infer_scalar_dtype_hint(cond_val)
+                    numeric_ct = _infer_numeric_type(cond_val)
+                    if numeric_ct:
+                        ct_enum = ConditionType(_norm_condition_type(numeric_ct))
+                    elif _is_iso_date(cond_val):
+                        ct_enum = ConditionType.expression
                     else:
-                        if rank.get(dtype,1) > rank.get(cur.data_type,1):
-                            cur.data_type = dtype
-            inputs = list(seen.values())
-            return RuleMapResponse(
-                rule_name=rule_name or None,
-                rule_details=rule_details or None,
-                inputs=inputs,
-                groups=groups
-            )
+                        ct_enum = ConditionType.string_value
+                    norm_group.append(Statement(
+                        Column=col_name,
+                        Operator=op_enum,
+                        Condition_Type=ct_enum,
+                        Condition_Value=cond_val,
+                        DType=dtype_hint
+                    ))
+                    continue
 
-    except HTTPException:
-        raise
-    except ValidationError as ve:
-        # Pydantic typed error
-        raise HTTPException(status_code=400, detail=ve.errors())
+                # (5) is / is not (null, timestamp, string/number/date)
+                if op_enum in (Operator.is_, Operator.is_not):
+                    lower = cond_val.lower()
+                    if lower in ("null", "none", ""):
+                        ct_enum = ConditionType.null_value
+                        cv = ""
+                        hint = None
+                    elif lower in ("current timestamp", "now", "today"):
+                        ct_enum = ConditionType.current_timestamp
+                        cv = ""
+                        hint = "Date/Time"
+                    else:
+                        hint = _infer_scalar_dtype_hint(cond_val)
+                        num_ct = _infer_numeric_type(cond_val)
+                        if num_ct:
+                            ct_enum = ConditionType(_norm_condition_type(num_ct))
+                        elif _is_iso_date(cond_val):
+                            ct_enum = ConditionType.expression
+                        else:
+                            ct_enum = ConditionType.string_value
+                        cv = cond_val
+                    norm_group.append(Statement(
+                        Column=col_name,
+                        Operator=op_enum,
+                        Condition_Type=ct_enum,
+                        Condition_Value=cv,
+                        DType=hint
+                    ))
+                    continue
+
+                # Fallback: push as-is (should be rare due to schema enforcement)
+                norm_group.append(stt)
+
+            normalized_groups.append(norm_group)
+
+        # --- Build inputs from referenced columns (for Input Columns section) ---
+        seen: Dict[str, InputColumn] = {}
+        rank = {"Date/Time": 3, "Float": 2, "Integer": 2, "String": 1}
+        for group in normalized_groups:
+            for s in group:
+                col = (s.Column or "").strip()
+                if not col:
+                    continue
+                # derive dtype from DType hint
+                hint = s.DType or "String"
+                dtype = _to_ui_dtype(hint)
+                cur = seen.get(col)
+                if not cur:
+                    seen[col] = InputColumn(name=col, data_type=dtype, description="", max_length="")
+                else:
+                    # prefer stronger type
+                    if rank.get(dtype, 1) > rank.get(cur.data_type, 1):
+                        cur.data_type = dtype
+
+        inputs = list(seen.values())
+
+        out = RuleMapResponse(
+            rule_name=parsed.rule_name,
+            rule_details=parsed.rule_details,
+            inputs=inputs,
+            groups=normalized_groups
+        )
+
+        # Optional explicit encoding to ensure enums serialize as values
+        return jsonable_encoder(out, by_alias=True, exclude_none=True)
+
     except Exception as e:
+        # Diagnostic: log raw model text if available
+        try:
+            print("[/nlp_rule_map] Exception:", e)
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail=f"NLP mapping failed: {e}")
