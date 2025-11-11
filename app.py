@@ -849,6 +849,8 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             " - 'not in' -> 'is not within'.\n"
             " - 'equals' -> 'is'; 'not equals' -> 'is not'; symbols (>,>=,<,<=) map to the corresponding operators.\n"
             " - Use the EXACT column names given in schema—do not invent columns.\n"
+            " - If the text mentions trimming/stripping spaces, emit an expression statement that applies Trim/LTrim/RTrim to the column BEFORE comparison.\n"
+            "   Example: for values {Male, Female} with trimming, use Condition_Type 'expression' with Condition_Value like \"Upper(Trim(gender)) IN ('MALE','FEMALE')\".\n"
             " - For list values, keep them as a comma-separated string in Condition_Value (e.g., \"A, B, C\").\n"
             " - Include rule_name and rule_details if implied by the text; else leave them empty.\n"
             " - Return ONLY JSON, no markdown, no comments, no trailing commas; keys/strings must use double-quotes.\n\n"
@@ -874,7 +876,9 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             raw_text = getattr(resp, "text", "") or ""
             print("[/nlp_rule_map] structured outputs failed, raw_text:", raw_text[:500])
             try:
-                txt = _strip_code_fences(raw_text)
+                txt = _strip_code_fences(raw_text).strip()
+                if not txt:
+                    raise HTTPException(status_code=400, detail=f"Invalid JSON from model: empty response after stripping code fences")
                 obj = json.loads(txt)  # strict JSON
                 parsed = RuleMapResponse(**obj)  # validate with Pydantic
             except Exception as e:
