@@ -872,17 +872,48 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
         )
 
         if getattr(resp, "parsed", None) is None:
-            # Fallback: try to coerce raw text into JSON and validate against RuleMapResponse
             raw_text = getattr(resp, "text", "") or ""
-            print("[/nlp_rule_map] structured outputs failed, raw_text:", raw_text[:500])
+            if not raw_text and getattr(resp, "candidates", None):
+                # Try to reconstruct text from candidates parts
+                try:
+                    cand = resp.candidates[0]
+                    parts = getattr(getattr(cand, "content", None), "parts", None)
+                    if parts:
+                        raw_text = "".join(getattr(p, "text", "") for p in parts if hasattr(p, "text"))
+                except Exception:
+                    pass
+
+            if not raw_text.strip():
+                # One more retry WITHOUT response_schema (plain JSON), same prompt
+                resp2 = genai_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=1024,
+                        temperature=0.0
+                    )
+                )
+                raw_text = getattr(resp2, "text", "") or ""
+                if not raw_text and getattr(resp2, "candidates", None):
+                    try:
+                        cand = resp2.candidates[0]
+                        parts = getattr(getattr(cand, "content", None), "parts", None)
+                        if parts:
+                            raw_text = "".join(getattr(p, "text", "") for p in parts if hasattr(p, "text"))
+                    except Exception:
+                        pass
+
+            txt = _strip_code_fences(raw_text).strip()
+            if not txt:
+                raise HTTPException(status_code=400,
+                                    detail="Invalid JSON from model: empty response after stripping code fences")
+
             try:
-                txt = _strip_code_fences(raw_text).strip()
-                if not txt:
-                    raise HTTPException(status_code=400, detail=f"Invalid JSON from model: empty response after stripping code fences")
-                obj = json.loads(txt)  # strict JSON
-                parsed = RuleMapResponse(**obj)  # validate with Pydantic
+                obj = json.loads(txt)
+                parsed = RuleMapResponse(**obj)
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid JSON from model: {e}")
+
         else:
             parsed: RuleMapResponse = resp.parsed  # Model returned structured output
 
@@ -1024,6 +1055,56 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
 
             normalized_groups.append(norm_group)
 
+        # --- Bonus hardening: enforce trim semantics if user text mentions spaces/trim ---
+        # If the NL text says "trim/strip leading/trailing spaces", upgrade simple string checks
+        # to expression-based comparisons on string columns.
+        if re.search(r"\b(trim|strip|leading|trailing\s+spaces)\b", text, flags=re.IGNORECASE):
+            for g_idx, g in enumerate(normalized_groups):
+                for s_idx, s in enumerate(g):
+                    # We only harden for string-like comparisons
+                    is_stringy = (s.DType or "String") == "String"
+                    if not is_stringy:
+                        continue
+
+                    col = (s.Column or "").strip()
+                    if not col:
+                        continue
+
+                    # Case A: lists ('is within' / 'is not within') -> make expression with Trim+Upper
+                    if s.Operator in (Operator.is_within, Operator.is_not_within) and (
+                            s.Condition_Value or "").strip():
+                        items = _split_list(s.Condition_Value)
+                        # Default to an expression under Operator 'is' (so UI shows expression editor)
+                        expr_items = ", ".join([f"'{v.upper()}'" for v in items]) if items else ""
+                        expr = f"Upper(Trim({col})) IN ({expr_items})"
+                        normalized_groups[g_idx][s_idx] = Statement(
+                            Column=col,
+                            Operator=Operator.is_,  # expression goes under 'is'
+                            Condition_Type=ConditionType.expression,
+                            Condition_Value=expr,
+                            DType="String"
+                        )
+                        continue
+
+                    # Case B: equality on single string value -> wrap with Trim+Upper
+                    if s.Operator in (Operator.is_, Operator.is_not) and s.Condition_Type in (
+                            ConditionType.string_value,
+                            ConditionType.expression,
+                    ):
+                        cv = (s.Condition_Value or "").strip()
+                        if cv and cv.lower() not in ("null", "none", "current timestamp", "now", "today"):
+                            # If cv is a single token (not a list), make an equality expression
+                            # Example: Upper(Trim(gender)) = 'MALE'
+                            expr = f"Upper(Trim({col})) = '{cv.upper()}'"
+                            normalized_groups[g_idx][s_idx] = Statement(
+                                Column=col,
+                                Operator=Operator.is_,  # keep 'is' for expression
+                                Condition_Type=ConditionType.expression,
+                                Condition_Value=expr,
+                                DType="String"
+                            )
+                            continue
+
         # --- Build inputs from referenced columns (for Input Columns section) ---
         seen: Dict[str, InputColumn] = {}
         rank = {"Date/Time": 3, "Float": 2, "Integer": 2, "String": 1}
@@ -1045,15 +1126,48 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
 
         inputs = list(seen.values())
 
+        # --- Predict dimension via LLM (closed set) ---
+        try:
+            class DimChoice(BaseModel):
+                dimension: str  # one of ['Completeness','Uniqueness','Consistency','Accuracy','Timeliness','Integrity']
+
+            dim_prompt = (
+                    "Given the following rule statements, classify the primary Data Quality dimension "
+                    "as one of: Completeness, Uniqueness, Consistency, Accuracy, Timeliness, Integrity.\n\n"
+                    f"Statements:\n" +
+                    "\n".join([f"- {s.Column} {s.Operator} {s.Condition_Type} {s.Condition_Value or ''}"
+                               for g in normalized_groups for s in g]) +
+                    "\n\nReturn ONLY JSON with field 'dimension'."
+            )
+
+            dim_resp = genai_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=dim_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=DimChoice,
+                    temperature=0.0,
+                    max_output_tokens=64
+                )
+            )
+            predicted_dim = getattr(dim_resp, "parsed", None).dimension if getattr(dim_resp, "parsed", None) else None
+        except Exception:
+            predicted_dim = None
+
         out = RuleMapResponse(
             rule_name=parsed.rule_name,
             rule_details=parsed.rule_details,
             inputs=inputs,
             groups=normalized_groups
         )
+        # Attach dimension if predicted
+        if predicted_dim:
+            out_dict = jsonable_encoder(out, by_alias=True, exclude_none=True)
+            out_dict["dimension"] = predicted_dim
+            return out_dict
 
-        # Optional explicit encoding to ensure enums serialize as values
         return jsonable_encoder(out, by_alias=True, exclude_none=True)
+
 
     except Exception as e:
         # Diagnostic: log raw model text if available
