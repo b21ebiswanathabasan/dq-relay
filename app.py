@@ -908,11 +908,29 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                 raise HTTPException(status_code=400,
                                     detail="Invalid JSON from model: empty response after stripping code fences")
 
-            try:
-                obj = json.loads(txt)
-                parsed = RuleMapResponse(**obj)
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Invalid JSON from model: {e}")
+            else:
+                # Try to parse the model JSON and validate via Pydantic
+                try:
+                    obj = json.loads(txt)
+                    parsed = RuleMapResponse(**obj)
+                except Exception as e:
+                    # If JSON parsing fails, use the same minimal fallback
+                    parsed = RuleMapResponse(
+                        rule_name="",
+                        rule_details=f"Warning: Fallback JSON used — parse error: {e}",
+                        inputs=[],
+                        groups=[
+                            [
+                                Statement(
+                                    Column="", Operator=Operator.is_,
+                                    Condition_Type=ConditionType.expression,
+                                    Condition_Value="/* Fallback after parse error */",
+                                    DType="String",
+                                )
+                            ]
+                        ]
+                    )
+
 
         else:
             parsed: RuleMapResponse = resp.parsed  # Model returned structured output
