@@ -924,42 +924,84 @@ def _heuristic_rulemap_from_text(text: str, schema_cols: List[Dict[str, Any]]) -
 def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
     """
     Convert NL into UI-ready Rule Builder groups & inferred Input Columns.
-    - Structured Outputs first.
-    - Robust fallback (no 400) + heuristic mapper when model returns unusable JSON.
-    - Post-normalization enforces: 'between' -> >= and <=, 'is within' -> function list, etc.
+    - Structured Outputs first (Pydantic schema).
+    - Robust fallback (no 400) + heuristics for common NL (between, lists, uniqueness).
+    - Post-normalization: 'between' -> >= and <=, 'is within' -> function list, etc.
     - Trim/strip hardener upgrades string comparisons to expression with Trim+Upper.
-    - Optional: predicts 'dimension' via LLM and attaches to the response.
+    - Predicts 'dimension' via LLM; if missing, uses heuristics; always returns 'dimension'.
     """
     try:
         text: str = (req.text or "").strip()
         schema_dict: Dict[str, Any] = req.schema or {}
-        # Extract schema columns if provided
         columns_in_schema: List[Dict[str, Any]] = schema_dict.get("columns", []) or []
         schema_cols_str = ", ".join(
             [f"{c.get('name')}: {c.get('dtype','')}" for c in columns_in_schema if c.get("name")]
         )
 
-        # Valid operator list matching your constants.OPERATORS
+        # --- Tiny helpers local to this function --------------------------------
+        def _split_items_natural(raw: str) -> List[str]:
+            s = (raw or "").strip().strip("{}")
+            s = re.sub(r"\s+(?:and|AND)\s+", ",", s)
+            s = s.replace("&", ",")
+            return [i.strip() for i in s.split(",") if i.strip()]
+
+        def _heuristic_rulemap_from_text(_t: str, _schema_cols: List[Dict[str, Any]]) -> Optional[RuleMapResponse]:
+            cols_set = {c.get("name") for c in (_schema_cols or []) if c.get("name")}
+            lower = (_t or "").lower()
+            statements: List[Statement] = []
+            inputs_map: Dict[str, InputColumn] = {}
+
+            # between: "<col> between 30 & 60"
+            m_between = re.search(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\bbetween\b\s*([+-]?\d+(?:\.\d+)?)\s*&\s*([+-]?\d+(?:\.\d+)?)",
+                _t, flags=re.IGNORECASE
+            )
+            if m_between:
+                col, a, b = m_between.group(1), m_between.group(2), m_between.group(3)
+                if (not cols_set) or (col in cols_set):
+                    statements += [
+                        Statement(Column=col, Operator=Operator.is_greater_equal,
+                                  Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+", a) else ConditionType.float_value,
+                                  Condition_Value=a, DType="Float/Integer"),
+                        Statement(Column=col, Operator=Operator.is_less_equal,
+                                  Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+", b) else ConditionType.float_value,
+                                  Condition_Value=b, DType="Float/Integer")
+                    ]
+                    inputs_map[col] = InputColumn(name=col, data_type="Integer", description="", max_length="")
+
+            # within: "<col> in Active, Live"
+            m_within = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\bin\b\s*\{?([A-Za-z0-9_ ,&]+)\}?", _t, flags=re.IGNORECASE)
+            if m_within:
+                col, raw = m_within.group(1), m_within.group(2)
+                items = _split_items_natural(raw)
+                if items and ((not cols_set) or (col in cols_set)):
+                    statements.append(Statement(Column=col, Operator=Operator.is_within,
+                                               Condition_Type=ConditionType.function,
+                                               Condition_Value=", ".join(items), DType="String"))
+                    inputs_map[col] = InputColumn(name=col, data_type="String", description="", max_length="")
+
+            # uniqueness: "<col> must be unique" or "no duplicates"
+            uniq_hits = set()
+            for sc in (cols_set or []):
+                if re.search(rf"\b{re.escape(sc)}\b[^.\n]*\b(unique|no\s+duplicates|distinct)\b", lower):
+                    uniq_hits.add(sc)
+            for col in uniq_hits:
+                statements.append(Statement(
+                    Column=col, Operator=Operator.is_, Condition_Type=ConditionType.expression,
+                    Condition_Value=f"IsUnique({col})", DType="String"   # <-- Template uses IsUnique()
+                ))
+                inputs_map[col] = InputColumn(name=col, data_type="String", description="", max_length="")
+
+            if statements:
+                return RuleMapResponse(rule_name="", rule_details="", inputs=list(inputs_map.values()), groups=[statements])
+            return None
+        # ------------------------------------------------------------------------
+
         operator_list = [
             "contains", "is", "is not", "is within", "is not within",
-            "is less than", "is less than or equal to",
-            "is greater than", "is greater than or equal to",
+            "is less than", "is less than or equal to", "is greater than", "is greater than or equal to",
         ]
 
-        # Valid condition types per operator matching constants.CONDITION_TYPES_MAP
-        cond_types_map = {
-            "contains": ["string value"],
-            "is": ["null value", "string value", "integer value", "float value", "current timestamp", "expression"],
-            "is not": ["null value", "string value", "integer value", "float value", "current timestamp", "expression"],
-            "is within": ["function"],
-            "is not within": ["function"],
-            "is less than": ["integer value", "float value", "expression"],
-            "is less than or equal to": ["integer value", "float value", "expression"],
-            "is greater than": ["integer value", "float value", "expression"],
-            "is greater than or equal to": ["integer value", "float value", "expression"],
-        }
-
-        # Prompt with strict instructions (removed quoted Example to reduce echo of non-strict JSON)
         prompt = (
             "You convert natural language DQ requirements into Rule Builder statements.\n"
             f"Valid operators: {operator_list}\n"
@@ -981,20 +1023,19 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             "Produce JSON matching RuleMapResponse."
         )
 
-        # --- Structured Outputs call with robust fallback ---
         resp = genai_client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=RuleMapResponse,  # parsed Pydantic object (Structured Outputs)
+                response_schema=RuleMapResponse,  # Structured Outputs
                 temperature=0.0,
                 max_output_tokens=1024
             )
         )
 
+        # --- Fallback (no 400) ---
         if getattr(resp, "parsed", None) is None:
-            # PRIMARY fallback: harvest raw text from resp.text or candidates.parts
             raw_text = getattr(resp, "text", "") or ""
             if (not raw_text.strip()) and getattr(resp, "candidates", None):
                 try:
@@ -1008,15 +1049,11 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                 except Exception:
                     pass
 
-            # SECOND fallback: retry WITHOUT response_schema (plain JSON mode)
             if not raw_text.strip():
                 resp2 = genai_client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=prompt,
-                    config=types.GenerateContentConfig(
-                        max_output_tokens=1024,
-                        temperature=0.0
-                    )
+                    config=types.GenerateContentConfig(max_output_tokens=1024, temperature=0.0)
                 )
                 raw_text = getattr(resp2, "text", "") or ""
                 if (not raw_text.strip()) and getattr(resp2, "candidates", None):
@@ -1033,243 +1070,178 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
 
             txt = _strip_code_fences(raw_text).strip()
 
-            # FINAL fallback: if still empty, use heuristic map or minimal safe response (no 400)
             if not txt:
                 heur = _heuristic_rulemap_from_text(text, columns_in_schema)
                 parsed = heur if heur else RuleMapResponse(
-                    rule_name="",
-                    rule_details="",
-                    inputs=[],
-                    groups=[[Statement(
-                        Column="", Operator=Operator.is_,
-                        Condition_Type=ConditionType.expression,
-                        Condition_Value="/* Fallback: model returned no JSON */",
-                        DType="String"
-                    )]]
+                    rule_name="", rule_details="", inputs=[],
+                    groups=[[Statement(Column="", Operator=Operator.is_,
+                                       Condition_Type=ConditionType.expression,
+                                       Condition_Value="/* Fallback: model returned no JSON */", DType="String")]]
                 )
             else:
-                # Try to parse strict JSON and validate with Pydantic
                 try:
                     obj = json.loads(txt)
                     parsed = RuleMapResponse(**obj)
                 except Exception:
-                    # Parse failed -> try heuristic; else minimal safe response
                     heur = _heuristic_rulemap_from_text(text, columns_in_schema)
                     parsed = heur if heur else RuleMapResponse(
-                        rule_name="",
-                        rule_details="",
-                        inputs=[],
-                        groups=[[Statement(
-                            Column="", Operator=Operator.is_,
-                            Condition_Type=ConditionType.expression,
-                            Condition_Value="/* Fallback after parse error */",
-                            DType="String"
-                        )]]
+                        rule_name="", rule_details="", inputs=[],
+                        groups=[[Statement(Column="", Operator=Operator.is_,
+                                           Condition_Type=ConditionType.expression,
+                                           Condition_Value="/* Fallback after parse error */", DType="String")]]
                     )
         else:
-            # Structured Outputs success path
             parsed: RuleMapResponse = resp.parsed
 
-        # --- Post-normalization: enforce rules & infer dtypes ---
+        # --- Post-normalization ---
         normalized_groups: List[List[Statement]] = []
         for group in parsed.groups:
             norm_group: List[Statement] = []
             for stt in group:
-                # normalize operator synonyms/symbols if any
                 op_norm = _norm_op(stt.Operator.value if isinstance(stt.Operator, Operator) else str(stt.Operator))
-                # map string -> Operator enum
-                if op_norm == "is":
-                    op_enum = Operator.is_
-                elif op_norm == "is not":
-                    op_enum = Operator.is_not
-                elif op_norm == "is within":
-                    op_enum = Operator.is_within
-                elif op_norm == "is not within":
-                    op_enum = Operator.is_not_within
-                elif op_norm == "is less than":
-                    op_enum = Operator.is_less_than
-                elif op_norm == "is less than or equal to":
-                    op_enum = Operator.is_less_equal
-                elif op_norm == "is greater than":
-                    op_enum = Operator.is_greater_than
-                elif op_norm == "is greater than or equal to":
-                    op_enum = Operator.is_greater_equal
-                elif op_norm == "contains":
-                    op_enum = Operator.contains
-                else:
-                    op_enum = Operator.is_  # default
+                if op_norm == "is":                    op_enum = Operator.is_
+                elif op_norm == "is not":              op_enum = Operator.is_not
+                elif op_norm == "is within":           op_enum = Operator.is_within
+                elif op_norm == "is not within":       op_enum = Operator.is_not_within
+                elif op_norm == "is less than":        op_enum = Operator.is_less_than
+                elif op_norm == "is less than or equal to": op_enum = Operator.is_less_equal
+                elif op_norm == "is greater than":     op_enum = Operator.is_greater_than
+                elif op_norm == "is greater than or equal to": op_enum = Operator.is_greater_equal
+                elif op_norm == "contains":            op_enum = Operator.contains
+                else:                                  op_enum = Operator.is_
 
                 col_name = (stt.Column or "").strip()
                 cond_val = (stt.Condition_Value or "").strip()
 
-                # (1) "between X and Y" in Condition_Value -> two statements
+                # 'between' -> two statements
                 if re.search(r"\bbetween\b", cond_val, flags=re.I):
                     m = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+)", cond_val, flags=re.I)
                     if m:
                         a, b = m.group(1).strip(), m.group(2).strip()
-                        hint_a = _infer_scalar_dtype_hint(a)
-                        hint_b = _infer_scalar_dtype_hint(b)
+                        hint_a, hint_b = _infer_scalar_dtype_hint(a), _infer_scalar_dtype_hint(b)
                         ct_a = _infer_numeric_type(a) or ("expression" if _is_iso_date(a) else "string value")
                         ct_b = _infer_numeric_type(b) or ("expression" if _is_iso_date(b) else "string value")
-                        norm_group.append(Statement(
-                            Column=col_name,
-                            Operator=Operator.is_greater_equal,
-                            Condition_Type=ConditionType(_norm_condition_type(ct_a)),
-                            Condition_Value=a,
-                            DType=hint_a
-                        ))
-                        norm_group.append(Statement(
-                            Column=col_name,
-                            Operator=Operator.is_less_equal,
-                            Condition_Type=ConditionType(_norm_condition_type(ct_b)),
-                            Condition_Value=b,
-                            DType=hint_b
-                        ))
+                        norm_group += [
+                            Statement(Column=col_name, Operator=Operator.is_greater_equal,
+                                      Condition_Type=ConditionType(_norm_condition_type(ct_a)),
+                                      Condition_Value=a, DType=hint_a),
+                            Statement(Column=col_name, Operator=Operator.is_less_equal,
+                                      Condition_Type=ConditionType(_norm_condition_type(ct_b)),
+                                      Condition_Value=b, DType=hint_b)
+                        ]
                         continue
 
-                # (2) within / not within -> function + typed list
+                # within lists
                 if op_enum in (Operator.is_within, Operator.is_not_within):
-                    items = _split_list(cond_val) if cond_val else _split_items_natural(cond_val)
+                    items = _split_items_natural(cond_val) if cond_val else []
                     dtype_hint = _infer_list_dtype_hint(items) if items else "String"
-                    norm_group.append(Statement(
-                        Column=col_name,
-                        Operator=op_enum,
-                        Condition_Type=ConditionType.function,
-                        Condition_Value=", ".join(items),
-                        DType=dtype_hint
-                    ))
+                    norm_group.append(Statement(Column=col_name, Operator=op_enum,
+                                                Condition_Type=ConditionType.function,
+                                                Condition_Value=", ".join(items), DType=dtype_hint))
                     continue
 
-                # (3) contains -> string value
+                # contains
                 if op_enum == Operator.contains:
-                    norm_group.append(Statement(
-                        Column=col_name,
-                        Operator=op_enum,
-                        Condition_Type=ConditionType.string_value,
-                        Condition_Value=cond_val,
-                        DType="String"
-                    ))
+                    norm_group.append(Statement(Column=col_name, Operator=op_enum,
+                                                Condition_Type=ConditionType.string_value,
+                                                Condition_Value=cond_val, DType="String"))
                     continue
 
-                # (4) numeric/date comparisons -> int/float/expression
+                # numeric/date comparisons
                 if op_enum in (Operator.is_less_than, Operator.is_less_equal,
                                Operator.is_greater_than, Operator.is_greater_equal):
                     dtype_hint = _infer_scalar_dtype_hint(cond_val)
-                    numeric_ct = _infer_numeric_type(cond_val)
-                    if numeric_ct:
-                        ct_enum = ConditionType(_norm_condition_type(numeric_ct))
-                    elif _is_iso_date(cond_val):
-                        ct_enum = ConditionType.expression
-                    else:
-                        ct_enum = ConditionType.string_value
-                    norm_group.append(Statement(
-                        Column=col_name,
-                        Operator=op_enum,
-                        Condition_Type=ct_enum,
-                        Condition_Value=cond_val,
-                        DType=dtype_hint
-                    ))
+                    num_ct = _infer_numeric_type(cond_val)
+                    ct_enum = ConditionType(_norm_condition_type(num_ct)) if num_ct \
+                              else (ConditionType.expression if _is_iso_date(cond_val) else ConditionType.string_value)
+                    norm_group.append(Statement(Column=col_name, Operator=op_enum,
+                                                Condition_Type=ct_enum,
+                                                Condition_Value=cond_val, DType=dtype_hint))
                     continue
 
-                # (5) is / is not (null, timestamp, string/number/date)
+                # is / is not
                 if op_enum in (Operator.is_, Operator.is_not):
                     lower_cv = cond_val.lower()
                     if lower_cv in ("null", "none", ""):
-                        ct_enum = ConditionType.null_value
-                        cv = ""
-                        hint = None
+                        ct_enum, cv, hint = ConditionType.null_value, "", None
                     elif lower_cv in ("current timestamp", "now", "today"):
-                        ct_enum = ConditionType.current_timestamp
-                        cv = ""
-                        hint = "Date/Time"
+                        ct_enum, cv, hint = ConditionType.current_timestamp, "", "Date/Time"
                     else:
                         hint = _infer_scalar_dtype_hint(cond_val)
                         num_ct = _infer_numeric_type(cond_val)
-                        if num_ct:
-                            ct_enum = ConditionType(_norm_condition_type(num_ct))
-                        elif _is_iso_date(cond_val):
-                            ct_enum = ConditionType.expression
-                        else:
-                            ct_enum = ConditionType.string_value
+                        ct_enum = ConditionType(_norm_condition_type(num_ct)) if num_ct \
+                                  else (ConditionType.expression if _is_iso_date(cond_val) else ConditionType.string_value)
                         cv = cond_val
-                    norm_group.append(Statement(
-                        Column=col_name,
-                        Operator=op_enum,
-                        Condition_Type=ct_enum,
-                        Condition_Value=cv,
-                        DType=hint
-                    ))
+                    norm_group.append(Statement(Column=col_name, Operator=op_enum,
+                                                Condition_Type=ct_enum, Condition_Value=cv, DType=hint))
                     continue
 
-                # Fallback: push as-is (rare due to schema enforcement)
                 norm_group.append(stt)
 
             normalized_groups.append(norm_group)
 
-        # --- Bonus hardening: enforce trim semantics if user text mentions spaces/trim ---
-        # If the NL text says "trim/strip leading/trailing spaces", upgrade simple string checks
-        # to expression-based comparisons on string columns.
+        # --- Trim/strip hardener (regex fixed) ---
         if re.search(r"\b(trim|strip|leading|trailing\s+spaces)\b", text, flags=re.IGNORECASE):
             for g_idx, g in enumerate(normalized_groups):
                 for s_idx, s in enumerate(g):
-                    is_stringy = (s.DType or "String") == "String"
-                    if not is_stringy:
-                        continue
+                    if (s.DType or "String") != "String":  continue
                     col = (s.Column or "").strip()
-                    if not col:
-                        continue
+                    if not col:                             continue
 
-                    # Case A: lists -> expression with Trim+Upper
                     if s.Operator in (Operator.is_within, Operator.is_not_within) and (s.Condition_Value or "").strip():
-                        items = _split_list(s.Condition_Value) if s.Condition_Value else []
+                        items = _split_items_natural(s.Condition_Value)
                         expr_items = ", ".join([f"'{v.upper()}'" for v in items]) if items else ""
-                        expr = f"Upper(Trim({col})) IN ({expr_items})"
                         normalized_groups[g_idx][s_idx] = Statement(
-                            Column=col,
-                            Operator=Operator.is_,                 # expression goes under 'is'
+                            Column=col, Operator=Operator.is_,
                             Condition_Type=ConditionType.expression,
-                            Condition_Value=expr,
+                            Condition_Value=f"Upper(Trim({col})) IN ({expr_items})",
                             DType="String"
                         )
                         continue
 
-                    # Case B: equality on single string value -> wrap with Trim+Upper
-                    if s.Operator in (Operator.is_, Operator.is_not) and s.Condition_Type in (
-                        ConditionType.string_value, ConditionType.expression,
-                    ):
+                    if s.Operator in (Operator.is_, Operator.is_not) and s.Condition_Type in (ConditionType.string_value, ConditionType.expression):
                         cv = (s.Condition_Value or "").strip()
                         if cv and cv.lower() not in ("null", "none", "current timestamp", "now", "today"):
-                            expr = f"Upper(Trim({col})) = '{cv.upper()}'"
                             normalized_groups[g_idx][s_idx] = Statement(
-                                Column=col,
-                                Operator=Operator.is_,                 # keep 'is' for expression
+                                Column=col, Operator=Operator.is_,
                                 Condition_Type=ConditionType.expression,
-                                Condition_Value=expr,
+                                Condition_Value=f"Upper(Trim({col})) = '{cv.upper()}'",
                                 DType="String"
                             )
                             continue
 
-        # --- Build inputs from referenced columns (for Input Columns section) ---
+        # --- Completer: add uniqueness statements if NL text requires it ---
+        uniq_needles = re.findall(r"['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\b[^.\n]*\b(unique|no\s+duplicates|distinct)\b", text, flags=re.IGNORECASE)
+        uniq_cols_from_text = {m[0] for m in uniq_needles}
+        if uniq_cols_from_text:
+            existing_uniqs = {s.Column.strip() for g in normalized_groups for s in g
+                              if s.Condition_Type == ConditionType.expression and (s.Condition_Value or "").startswith("IsUnique(")}
+            for col in uniq_cols_from_text:
+                if col and col not in existing_uniqs:
+                    normalized_groups.append([
+                        Statement(Column=col, Operator=Operator.is_,
+                                  Condition_Type=ConditionType.expression,
+                                  Condition_Value=f"IsUnique({col})",    # <-- Template uses IsUnique()
+                                  DType="String")
+                    ])
+
+        # --- Build inputs ---
         seen: Dict[str, InputColumn] = {}
         rank = {"Date/Time": 3, "Float": 2, "Integer": 2, "String": 1}
         for group in normalized_groups:
             for s in group:
                 col = (s.Column or "").strip()
-                if not col:
-                    continue
-                # derive dtype from DType hint
+                if not col: continue
                 hint = s.DType or "String"
                 dtype = _to_ui_dtype(hint)
                 cur = seen.get(col)
                 if not cur:
                     seen[col] = InputColumn(name=col, data_type=dtype, description="", max_length="")
-                else:
-                    # prefer stronger type
-                    if rank.get(dtype, 1) > rank.get(cur.data_type, 1):
-                        cur.data_type = dtype
+                elif rank.get(dtype, 1) > rank.get(cur.data_type, 1):
+                    cur.data_type = dtype
         inputs = list(seen.values())
 
-        # --- Predict dimension via LLM (closed set) ---
+        # --- Predict dimension via LLM + heuristic fallback ---
         try:
             class DimChoice(BaseModel):
                 dimension: str  # one of ['Completeness','Uniqueness','Consistency','Accuracy','Timeliness','Integrity']
@@ -1282,40 +1254,44 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                            for g in normalized_groups for s in g]) +
                 "\n\nReturn ONLY JSON with field 'dimension'."
             )
-
             dim_resp = genai_client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=dim_prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=DimChoice,
-                    temperature=0.0,
-                    max_output_tokens=64
-                )
+                config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=DimChoice,
+                                                   temperature=0.0, max_output_tokens=64)
             )
             predicted_dim = getattr(dim_resp, "parsed", None).dimension if getattr(dim_resp, "parsed", None) else None
         except Exception:
             predicted_dim = None
 
-        out = RuleMapResponse(
-            rule_name=parsed.rule_name,
-            rule_details=parsed.rule_details,
-            inputs=inputs,
-            groups=normalized_groups
-        )
+        if not predicted_dim:
+            txt_all = (text or "").lower() + " " + " ".join([
+                f"{s.Column} {s.Operator} {s.Condition_Type} {s.Condition_Value or ''}".lower()
+                for g in normalized_groups for s in g
+            ])
+            if any(k in txt_all for k in ["null", "missing", "blank", "empty", "completeness"]):
+                predicted_dim = "Completeness"
+            elif any(k in txt_all for k in ["duplicate", "uniq", "unique", "distinct"]):
+                predicted_dim = "Uniqueness"
+            elif any(k in txt_all for k in ["format", "regex", "pattern", "length", "datatype", "type check", "valid"]):
+                predicted_dim = "Consistency"
+            elif any(k in txt_all for k in [">=", "<=", ">", "<", "between", "range", "within", "threshold", "accuracy"]):
+                predicted_dim = "Accuracy"
+            elif any(k in txt_all for k in ["timestamp", "time", "date", "recent", "late", "timeliness"]):
+                predicted_dim = "Timeliness"
+            elif any(k in txt_all for k in ["reference", "referential", "foreign key", "fk", "parent", "child", "integrity"]):
+                predicted_dim = "Integrity"
+            else:
+                predicted_dim = "Consistency"
 
-        # Attach dimension if predicted
+        out = RuleMapResponse(rule_name=parsed.rule_name, rule_details=parsed.rule_details, inputs=inputs, groups=normalized_groups)
         out_dict = jsonable_encoder(out, by_alias=True, exclude_none=True)
-        if predicted_dim:
-            out_dict["dimension"] = predicted_dim
-
+        out_dict["dimension"] = predicted_dim
         return out_dict
 
     except Exception as e:
-        # Diagnostic: log the exception (no sensitive data)
         try:
             print("[/nlp_rule_map] Exception:", e)
         except Exception:
             pass
-        # Always return a structured error to the client
         raise HTTPException(status_code=400, detail=f"NLP mapping failed: {e}")
