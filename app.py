@@ -797,21 +797,144 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
         sources=[]
     )
 
-# ------------------------------------------------------------------------------------
-# The endpoint — UPDATED with robust fallback and normalizers
-# ------------------------------------------------------------------------------------
+
+# --- Helpers for robust fallback -------------------------------------------------
+
+def _split_items_natural(raw: str) -> List[str]:
+    """
+    Split a natural-language list like:
+      "Active, Live", "Active and Live", "Active & Live", "{Active, Live}"
+    into ["Active", "Live"].
+    """
+    s = (raw or "").strip()
+    s = s.strip("{}")
+    # Normalize common conjunctions to comma
+    s = re.sub(r"\s+(?:and|AND)\s+", ",", s)
+    s = s.replace("&", ",")
+    # Final split on comma
+    items = [i.strip() for i in s.split(",") if i.strip()]
+    return items
+
+def _heuristic_rulemap_from_text(text: str, schema_cols: List[Dict[str, Any]]) -> Optional[RuleMapResponse]:
+    """
+    Very small heuristic to cover common NL patterns when the model returns no JSON:
+    - "<col> between 30 & 60"
+    - "<col> in Active, Live" / "<col> in {Active, Live}" / "<col> in Active and Live"
+    - "Ensure '<col>' is unique / no duplicates"
+    Produces one group with AND across all detected statements.
+    """
+    cols_set = {c.get("name") for c in (schema_cols or []) if c.get("name")}
+    t = text or ""
+    lower = t.lower()
+
+    groups: List[List[Statement]] = []
+    statements: List[Statement] = []
+    inputs_map: Dict[str, InputColumn] = {}
+
+    # Try to spot columns explicitly quoted in NL (e.g., 'customer_id')
+    quoted_cols = set(re.findall(r"[\"']([A-Za-z_][A-Za-z0-9_]*)[\"']", t))
+
+    # (1) between: "<col> between A & B"  -- allow numbers (int/float) or dates in future
+    m_between = re.search(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\bbetween\b\s*([+-]?\d+(?:\.\d+)?)\s*&\s*([+-]?\d+(?:\.\d+)?)",
+        t, flags=re.IGNORECASE
+    )
+    if m_between:
+        col = m_between.group(1)
+        a = m_between.group(2)
+        b = m_between.group(3)
+        if (not cols_set) or (col in cols_set) or (col in quoted_cols):
+            statements.append(Statement(
+                Column=col,
+                Operator=Operator.is_greater_equal,
+                Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+", a) else ConditionType.float_value,
+                Condition_Value=a,
+                DType="Float/Integer"
+            ))
+            statements.append(Statement(
+                Column=col,
+                Operator=Operator.is_less_equal,
+                Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+", b) else ConditionType.float_value,
+                Condition_Value=b,
+                DType="Float/Integer"
+            ))
+            inputs_map[col] = InputColumn(name=col, data_type="Integer", description="", max_length="")
+
+    # (2) within: "<col> in Active, Live" or "{Active, Live}" or "Active and Live"
+    m_within = re.search(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\bin\b\s*\{?([A-Za-z0-9_ ,&]+)\}?",
+        t, flags=re.IGNORECASE
+    )
+    if m_within:
+        col = m_within.group(1)
+        raw = m_within.group(2)
+        items = _split_items_natural(raw)
+        if items and ((not cols_set) or (col in cols_set) or (col in quoted_cols)):
+            statements.append(Statement(
+                Column=col,
+                Operator=Operator.is_within,
+                Condition_Type=ConditionType.function,
+                Condition_Value=", ".join(items),
+                DType="String"
+            ))
+            inputs_map[col] = InputColumn(name=col, data_type="String", description="", max_length="")
+
+    # (3) uniqueness: "<col> must be unique" or "no duplicates"
+    # We scan for either a quoted col or any schema column in the text near uniqueness keywords.
+    uniq_hits = set()
+    uniq_keywords = r"(unique|no\s+duplicates|distinct)"
+    # Quoted column occurrence
+    for qc in quoted_cols:
+        if re.search(rf"\b{re.escape(qc)}\b[^.\n]*\b{uniq_keywords}\b", lower):
+            uniq_hits.add(qc)
+    # Any schema column occurrence
+    for sc in (cols_set or []):
+        if re.search(rf"\b{re.escape(sc)}\b[^.\n]*\b{uniq_keywords}\b", lower):
+            uniq_hits.add(sc)
+    # If no schema was provided, try to guess a token before 'column'
+    if not uniq_hits and not cols_set:
+        m_guess = re.search(r"['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\s+column\b[^.\n]*\b(unique|no\s+duplicates|distinct)\b", lower)
+        if m_guess:
+            uniq_hits.add(m_guess.group(1))
+
+    for col in uniq_hits:
+        statements.append(Statement(
+            Column=col,
+            Operator=Operator.is_,  # drive expression under 'is'
+            Condition_Type=ConditionType.expression,
+            Condition_Value=f"CountDistinct({col}) = Count({col})",
+            DType="String"
+        ))
+        inputs_map[col] = InputColumn(name=col, data_type="String", description="", max_length="")
+
+    if statements:
+        groups = [statements]  # single AND-group
+        return RuleMapResponse(
+            rule_name="",
+            rule_details="",
+            inputs=list(inputs_map.values()),
+            groups=groups
+        )
+    return None
+
+
+# --- Endpoint: /nlp_rule_map ----------------------------------------------------
+
 @app.post("/nlp_rule_map", response_model=RuleMapResponse)
 def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
     """
     Convert NL into UI-ready Rule Builder groups & inferred Input Columns.
-    - Structured Outputs ensure valid JSON structure.
+    - Structured Outputs first.
+    - Robust fallback (no 400) + heuristic mapper when model returns unusable JSON.
     - Post-normalization enforces: 'between' -> >= and <=, 'is within' -> function list, etc.
+    - Trim/strip hardener upgrades string comparisons to expression with Trim+Upper.
+    - Optional: predicts 'dimension' via LLM and attaches to the response.
     """
     try:
         text: str = (req.text or "").strip()
         schema_dict: Dict[str, Any] = req.schema or {}
         # Extract schema columns if provided
-        columns_in_schema: List[Dict[str, Any]] = schema_dict.get("columns", [])
+        columns_in_schema: List[Dict[str, Any]] = schema_dict.get("columns", []) or []
         schema_cols_str = ", ".join(
             [f"{c.get('name')}: {c.get('dtype','')}" for c in columns_in_schema if c.get("name")]
         )
@@ -826,17 +949,17 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
         # Valid condition types per operator matching constants.CONDITION_TYPES_MAP
         cond_types_map = {
             "contains": ["string value"],
-            "is": ["null value","string value","integer value","float value","current timestamp","expression"],
-            "is not": ["null value","string value","integer value","float value","current timestamp","expression"],
+            "is": ["null value", "string value", "integer value", "float value", "current timestamp", "expression"],
+            "is not": ["null value", "string value", "integer value", "float value", "current timestamp", "expression"],
             "is within": ["function"],
             "is not within": ["function"],
-            "is less than": ["integer value","float value","expression"],
-            "is less than or equal to": ["integer value","float value","expression"],
-            "is greater than": ["integer value","float value","expression"],
-            "is greater than or equal to": ["integer value","float value","expression"],
+            "is less than": ["integer value", "float value", "expression"],
+            "is less than or equal to": ["integer value", "float value", "expression"],
+            "is greater than": ["integer value", "float value", "expression"],
+            "is greater than or equal to": ["integer value", "float value", "expression"],
         }
 
-        # Prompt with strict instructions for the model — UPDATED hygiene
+        # Prompt with strict instructions (removed quoted Example to reduce echo of non-strict JSON)
         prompt = (
             "You convert natural language DQ requirements into Rule Builder statements.\n"
             f"Valid operators: {operator_list}\n"
@@ -847,10 +970,9 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             "   one with 'is greater than or equal to' A, and one with 'is less than or equal to' B.\n"
             " - 'in {a,b,c}', 'one of', 'is within' map to operator 'is within' and Condition_Type 'function'.\n"
             " - 'not in' -> 'is not within'.\n"
-            " - 'equals' -> 'is'; 'not equals' -> 'is not'; symbols (>,>=,<,<=) map to the corresponding operators.\n"
+            " - 'equals' -> 'is'; 'not equals' -> 'is not'; symbols (> ,>= ,< ,<=) map to the corresponding operators.\n"
             " - Use the EXACT column names given in schema—do not invent columns.\n"
-            " - If the text mentions trimming/stripping spaces, emit an expression statement that applies Trim/LTrim/RTrim to the column BEFORE comparison.\n"
-            "   Example: for values {Male, Female} with trimming, use Condition_Type 'expression' with Condition_Value like \"Upper(Trim(gender)) IN ('MALE','FEMALE')\".\n"
+            " - If the text mentions trimming/stripping spaces, emit an expression that applies Trim/LTrim/RTrim BEFORE comparison.\n"
             " - For list values, keep them as a comma-separated string in Condition_Value (e.g., \"A, B, C\").\n"
             " - Include rule_name and rule_details if implied by the text; else leave them empty.\n"
             " - Return ONLY JSON, no markdown, no comments, no trailing commas; keys/strings must use double-quotes.\n\n"
@@ -865,26 +987,29 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=RuleMapResponse,  # parsed Pydantic object
+                response_schema=RuleMapResponse,  # parsed Pydantic object (Structured Outputs)
                 temperature=0.0,
                 max_output_tokens=1024
             )
         )
 
         if getattr(resp, "parsed", None) is None:
+            # PRIMARY fallback: harvest raw text from resp.text or candidates.parts
             raw_text = getattr(resp, "text", "") or ""
-            if not raw_text and getattr(resp, "candidates", None):
-                # Try to reconstruct text from candidates parts
+            if (not raw_text.strip()) and getattr(resp, "candidates", None):
                 try:
                     cand = resp.candidates[0]
                     parts = getattr(getattr(cand, "content", None), "parts", None)
                     if parts:
-                        raw_text = "".join(getattr(p, "text", "") for p in parts if hasattr(p, "text"))
+                        raw_text = "".join(
+                            getattr(p, "text", "") for p in parts
+                            if hasattr(p, "text") and isinstance(getattr(p, "text"), str)
+                        )
                 except Exception:
                     pass
 
+            # SECOND fallback: retry WITHOUT response_schema (plain JSON mode)
             if not raw_text.strip():
-                # One more retry WITHOUT response_schema (plain JSON), same prompt
                 resp2 = genai_client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=prompt,
@@ -894,46 +1019,56 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                     )
                 )
                 raw_text = getattr(resp2, "text", "") or ""
-                if not raw_text and getattr(resp2, "candidates", None):
+                if (not raw_text.strip()) and getattr(resp2, "candidates", None):
                     try:
                         cand = resp2.candidates[0]
                         parts = getattr(getattr(cand, "content", None), "parts", None)
                         if parts:
-                            raw_text = "".join(getattr(p, "text", "") for p in parts if hasattr(p, "text"))
+                            raw_text = "".join(
+                                getattr(p, "text", "") for p in parts
+                                if hasattr(p, "text") and isinstance(getattr(p, "text"), str)
+                            )
                     except Exception:
                         pass
 
             txt = _strip_code_fences(raw_text).strip()
-            if not txt:
-                raise HTTPException(status_code=400,
-                                    detail="Invalid JSON from model: empty response after stripping code fences")
 
+            # FINAL fallback: if still empty, use heuristic map or minimal safe response (no 400)
+            if not txt:
+                heur = _heuristic_rulemap_from_text(text, columns_in_schema)
+                parsed = heur if heur else RuleMapResponse(
+                    rule_name="",
+                    rule_details="",
+                    inputs=[],
+                    groups=[[Statement(
+                        Column="", Operator=Operator.is_,
+                        Condition_Type=ConditionType.expression,
+                        Condition_Value="/* Fallback: model returned no JSON */",
+                        DType="String"
+                    )]]
+                )
             else:
-                # Try to parse the model JSON and validate via Pydantic
+                # Try to parse strict JSON and validate with Pydantic
                 try:
                     obj = json.loads(txt)
                     parsed = RuleMapResponse(**obj)
-                except Exception as e:
-                    # If JSON parsing fails, use the same minimal fallback
-                    parsed = RuleMapResponse(
+                except Exception:
+                    # Parse failed -> try heuristic; else minimal safe response
+                    heur = _heuristic_rulemap_from_text(text, columns_in_schema)
+                    parsed = heur if heur else RuleMapResponse(
                         rule_name="",
-                        rule_details=f"Warning: Fallback JSON used — parse error: {e}",
+                        rule_details="",
                         inputs=[],
-                        groups=[
-                            [
-                                Statement(
-                                    Column="", Operator=Operator.is_,
-                                    Condition_Type=ConditionType.expression,
-                                    Condition_Value="/* Fallback after parse error */",
-                                    DType="String",
-                                )
-                            ]
-                        ]
+                        groups=[[Statement(
+                            Column="", Operator=Operator.is_,
+                            Condition_Type=ConditionType.expression,
+                            Condition_Value="/* Fallback after parse error */",
+                            DType="String"
+                        )]]
                     )
-
-
         else:
-            parsed: RuleMapResponse = resp.parsed  # Model returned structured output
+            # Structured Outputs success path
+            parsed: RuleMapResponse = resp.parsed
 
         # --- Post-normalization: enforce rules & infer dtypes ---
         normalized_groups: List[List[Statement]] = []
@@ -967,15 +1102,15 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                 col_name = (stt.Column or "").strip()
                 cond_val = (stt.Condition_Value or "").strip()
 
-                # (1) between ? two rows (>= A, <= B) — UPDATED extractor
+                # (1) "between X and Y" in Condition_Value -> two statements
                 if re.search(r"\bbetween\b", cond_val, flags=re.I):
                     m = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+)", cond_val, flags=re.I)
                     if m:
                         a, b = m.group(1).strip(), m.group(2).strip()
                         hint_a = _infer_scalar_dtype_hint(a)
                         hint_b = _infer_scalar_dtype_hint(b)
-                        # >= A row
                         ct_a = _infer_numeric_type(a) or ("expression" if _is_iso_date(a) else "string value")
+                        ct_b = _infer_numeric_type(b) or ("expression" if _is_iso_date(b) else "string value")
                         norm_group.append(Statement(
                             Column=col_name,
                             Operator=Operator.is_greater_equal,
@@ -983,8 +1118,6 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                             Condition_Value=a,
                             DType=hint_a
                         ))
-                        # <= B row
-                        ct_b = _infer_numeric_type(b) or ("expression" if _is_iso_date(b) else "string value")
                         norm_group.append(Statement(
                             Column=col_name,
                             Operator=Operator.is_less_equal,
@@ -992,11 +1125,11 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                             Condition_Value=b,
                             DType=hint_b
                         ))
-                        continue  # next statement
+                        continue
 
-                # (2) within / not within ? function + typed list — UPDATED splitter
+                # (2) within / not within -> function + typed list
                 if op_enum in (Operator.is_within, Operator.is_not_within):
-                    items = _split_list(cond_val)
+                    items = _split_list(cond_val) if cond_val else _split_items_natural(cond_val)
                     dtype_hint = _infer_list_dtype_hint(items) if items else "String"
                     norm_group.append(Statement(
                         Column=col_name,
@@ -1007,7 +1140,7 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                     ))
                     continue
 
-                # (3) contains ? string value
+                # (3) contains -> string value
                 if op_enum == Operator.contains:
                     norm_group.append(Statement(
                         Column=col_name,
@@ -1018,7 +1151,7 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                     ))
                     continue
 
-                # (4) numeric/date comparisons ? pick int/float/expression
+                # (4) numeric/date comparisons -> int/float/expression
                 if op_enum in (Operator.is_less_than, Operator.is_less_equal,
                                Operator.is_greater_than, Operator.is_greater_equal):
                     dtype_hint = _infer_scalar_dtype_hint(cond_val)
@@ -1040,12 +1173,12 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
 
                 # (5) is / is not (null, timestamp, string/number/date)
                 if op_enum in (Operator.is_, Operator.is_not):
-                    lower = cond_val.lower()
-                    if lower in ("null", "none", ""):
+                    lower_cv = cond_val.lower()
+                    if lower_cv in ("null", "none", ""):
                         ct_enum = ConditionType.null_value
                         cv = ""
                         hint = None
-                    elif lower in ("current timestamp", "now", "today"):
+                    elif lower_cv in ("current timestamp", "now", "today"):
                         ct_enum = ConditionType.current_timestamp
                         cv = ""
                         hint = "Date/Time"
@@ -1068,7 +1201,7 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                     ))
                     continue
 
-                # Fallback: push as-is (should be rare due to schema enforcement)
+                # Fallback: push as-is (rare due to schema enforcement)
                 norm_group.append(stt)
 
             normalized_groups.append(norm_group)
@@ -1079,25 +1212,21 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
         if re.search(r"\b(trim|strip|leading|trailing\s+spaces)\b", text, flags=re.IGNORECASE):
             for g_idx, g in enumerate(normalized_groups):
                 for s_idx, s in enumerate(g):
-                    # We only harden for string-like comparisons
                     is_stringy = (s.DType or "String") == "String"
                     if not is_stringy:
                         continue
-
                     col = (s.Column or "").strip()
                     if not col:
                         continue
 
-                    # Case A: lists ('is within' / 'is not within') -> make expression with Trim+Upper
-                    if s.Operator in (Operator.is_within, Operator.is_not_within) and (
-                            s.Condition_Value or "").strip():
-                        items = _split_list(s.Condition_Value)
-                        # Default to an expression under Operator 'is' (so UI shows expression editor)
+                    # Case A: lists -> expression with Trim+Upper
+                    if s.Operator in (Operator.is_within, Operator.is_not_within) and (s.Condition_Value or "").strip():
+                        items = _split_list(s.Condition_Value) if s.Condition_Value else []
                         expr_items = ", ".join([f"'{v.upper()}'" for v in items]) if items else ""
                         expr = f"Upper(Trim({col})) IN ({expr_items})"
                         normalized_groups[g_idx][s_idx] = Statement(
                             Column=col,
-                            Operator=Operator.is_,  # expression goes under 'is'
+                            Operator=Operator.is_,                 # expression goes under 'is'
                             Condition_Type=ConditionType.expression,
                             Condition_Value=expr,
                             DType="String"
@@ -1106,17 +1235,14 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
 
                     # Case B: equality on single string value -> wrap with Trim+Upper
                     if s.Operator in (Operator.is_, Operator.is_not) and s.Condition_Type in (
-                            ConditionType.string_value,
-                            ConditionType.expression,
+                        ConditionType.string_value, ConditionType.expression,
                     ):
                         cv = (s.Condition_Value or "").strip()
                         if cv and cv.lower() not in ("null", "none", "current timestamp", "now", "today"):
-                            # If cv is a single token (not a list), make an equality expression
-                            # Example: Upper(Trim(gender)) = 'MALE'
                             expr = f"Upper(Trim({col})) = '{cv.upper()}'"
                             normalized_groups[g_idx][s_idx] = Statement(
                                 Column=col,
-                                Operator=Operator.is_,  # keep 'is' for expression
+                                Operator=Operator.is_,                 # keep 'is' for expression
                                 Condition_Type=ConditionType.expression,
                                 Condition_Value=expr,
                                 DType="String"
@@ -1141,7 +1267,6 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                     # prefer stronger type
                     if rank.get(dtype, 1) > rank.get(cur.data_type, 1):
                         cur.data_type = dtype
-
         inputs = list(seen.values())
 
         # --- Predict dimension via LLM (closed set) ---
@@ -1150,12 +1275,12 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                 dimension: str  # one of ['Completeness','Uniqueness','Consistency','Accuracy','Timeliness','Integrity']
 
             dim_prompt = (
-                    "Given the following rule statements, classify the primary Data Quality dimension "
-                    "as one of: Completeness, Uniqueness, Consistency, Accuracy, Timeliness, Integrity.\n\n"
-                    f"Statements:\n" +
-                    "\n".join([f"- {s.Column} {s.Operator} {s.Condition_Type} {s.Condition_Value or ''}"
-                               for g in normalized_groups for s in g]) +
-                    "\n\nReturn ONLY JSON with field 'dimension'."
+                "Given the following rule statements, classify the primary Data Quality dimension "
+                "as one of: Completeness, Uniqueness, Consistency, Accuracy, Timeliness, Integrity.\n\n"
+                "Statements:\n" +
+                "\n".join([f"- {s.Column} {s.Operator} {s.Condition_Type} {s.Condition_Value or ''}"
+                           for g in normalized_groups for s in g]) +
+                "\n\nReturn ONLY JSON with field 'dimension'."
             )
 
             dim_resp = genai_client.models.generate_content(
@@ -1178,19 +1303,19 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             inputs=inputs,
             groups=normalized_groups
         )
+
         # Attach dimension if predicted
+        out_dict = jsonable_encoder(out, by_alias=True, exclude_none=True)
         if predicted_dim:
-            out_dict = jsonable_encoder(out, by_alias=True, exclude_none=True)
             out_dict["dimension"] = predicted_dim
-            return out_dict
 
-        return jsonable_encoder(out, by_alias=True, exclude_none=True)
-
+        return out_dict
 
     except Exception as e:
-        # Diagnostic: log raw model text if available
+        # Diagnostic: log the exception (no sensitive data)
         try:
             print("[/nlp_rule_map] Exception:", e)
         except Exception:
             pass
+        # Always return a structured error to the client
         raise HTTPException(status_code=400, detail=f"NLP mapping failed: {e}")
