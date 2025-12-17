@@ -248,6 +248,8 @@ class RuleMapResponse(BaseModel):
     rule_details: Optional[str] = None
     inputs: List[InputColumn]
     groups: List[List[Statement]]  # same shape as Streamlit Rule Builder
+    dimension: Optional[str] = None
+    dimension: Optional[str] = None
 
 class NlpRuleMapRequest(BaseModel):
     text: str
@@ -993,7 +995,7 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                 inputs_map[col] = InputColumn(name=col, data_type="String", description="", max_length="")
 
             if statements:
-                return RuleMapResponse(rule_name="", rule_details="", inputs=list(inputs_map.values()), groups=[statements])
+                return RuleMapResponse(rule_name="", rule_details="", inputs=list(inputs_map.values()), groups=[statements], dimension=None)
             return None
         # ------------------------------------------------------------------------
 
@@ -1284,7 +1286,7 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             else:
                 predicted_dim = "Consistency"
 
-        out = RuleMapResponse(rule_name=parsed.rule_name, rule_details=parsed.rule_details, inputs=inputs, groups=normalized_groups)
+        out = RuleMapResponse(rule_name=parsed.rule_name, rule_details=parsed.rule_details, inputs=inputs, groups=normalized_groups, dimension=predicted_dim)
         out_dict = jsonable_encoder(out, by_alias=True, exclude_none=True)
         out_dict["dimension"] = predicted_dim
         return out_dict
