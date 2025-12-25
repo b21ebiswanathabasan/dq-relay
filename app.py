@@ -636,8 +636,37 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         answer = "I don't have sufficient indexed context to answer that yet. Please load your reports or rules via /upsert_batch."
     return ChatResponse(answer=answer, sources=sources)
 
+
 @app.post("/recommend", response_model=RecommendationResponse)
 def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
+    # Detect mode tag in the incoming summary
+    mode = "SUMMARY"
+    m = re.search(r"\[MODE:\s*([A-Z_]+)\s*\]", req.profile_summary or "", flags=re.IGNORECASE)
+    if m:
+        mode = m.group(1).upper()
+
+    if mode == "DQ_RULES":
+        prompt = _strong_json_rules_prompt(req.profile_summary)
+        json_text = _gen_strict_json(
+            genai_client, model=os.getenv("GEN_MODEL", "gemini-2.5-flash"),
+            prompt=prompt, max_tokens=req.max_output_tokens, temperature=0.2
+        )
+        if not json_text or not json_text.strip().startswith("{"):
+            # Make it unambiguous for the client to fall back if needed
+            json_text = "{}"
+        return RecommendationResponse(recommendations=json_text)
+
+    if mode == "CLEANSING":
+        prompt = _strong_json_cleanse_prompt(req.profile_summary)
+        json_text = _gen_strict_json(
+            genai_client, model=os.getenv("GEN_MODEL", "gemini-2.5-flash"),
+            prompt=prompt, max_tokens=req.max_output_tokens, temperature=0.2
+        )
+        if not json_text or not json_text.strip().startswith("{"):
+            json_text = "{}"
+        return RecommendationResponse(recommendations=json_text)
+
+    # Default path: narrative markdown summary (unchanged)
     system_prompt = (
         "You are a Data Quality and Data Cleansing expert. "
         "Given a dataset profile summary, recommend specific DQ checks, "
@@ -665,6 +694,61 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
     if not answer:
         answer = "Gemini returned no usable text. Please check profile summary formatting."
     return RecommendationResponse(recommendations=answer)
+
+
+# --- Add these helpers near /recommend ---
+
+def _strong_json_rules_prompt(profile_summary: str) -> str:
+    example = (
+        "{\n"
+        '  "colA": ["NOT_NULL","UNIQUE", {"values":["A","B"]}, "DOMAIN_SET"],\n'
+        '  "colB": ["NOT_NULL","REGEX_MATCH:^\\d{4}-\\d{2}-\\d{2}$","DATE_PARSABLE"]\n'
+        "}"
+    )
+    return (
+        "You are a Data Quality rule designer. Return ONLY STRICT JSON—no prose, no markdown, no comments.\n"
+        "JSON must be a single object mapping column-name → array of items:\n"
+        "  • Simple constraints as strings: NOT_NULL, UNIQUE, DOMAIN_SET, DATE_PARSABLE, REGEX_MATCH:<pattern>\n"
+        "  • For domain sets, include an object {\"values\": [\"v1\",\"v2\",...]} alongside \"DOMAIN_SET\".\n"
+        f"Example:\n{example}\n\n"
+        "Constraints MUST be inferred only from the provided digest/columns.\n"
+        "Dataset Profile Summary:\n"
+        f"{profile_summary}\n"
+    )
+
+def _strong_json_cleanse_prompt(profile_summary: str) -> str:
+    example = (
+        "{\n"
+        '  "name": ["Trim leading/trailing spaces", "Uppercase canonical form"],\n'
+        '  "age": ["Impute missing with median", "Cap outliers at P99"],\n'
+        '  "email": ["Regex validate", "Lowercase before compare"]\n'
+        "}"
+    )
+    return (
+        "You are a Data Cleansing planner. Return ONLY STRICT JSON—no prose, no markdown, no comments.\n"
+        "JSON must be a single object mapping column-name → array of short actionable steps.\n"
+        f"Example:\n{example}\n\n"
+        "Base your plan strictly on the provided digest/columns.\n"
+        "Dataset Profile Summary:\n"
+        f"{profile_summary}\n"
+    )
+
+def _gen_strict_json(client, model: str, prompt: str, max_tokens: int, temperature: float) -> str:
+    # Prefer structured JSON text; keep SDK simple & robust
+    resp = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            temperature=temperature
+        )
+    )
+    text = getattr(resp, "text", "") or ""
+    if not text and getattr(resp, "candidates", None):
+        cand = resp.candidates[0]
+        if getattr(cand, "content", None) and getattr(cand.content, "parts", None):
+            text = "".join(getattr(p, "text", "") for p in cand.content.parts if hasattr(p, "text"))
+    return _strip_code_fences(text).strip()
 
 @app.post("/analytics", response_model=AnalyticsResponse)
 def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
