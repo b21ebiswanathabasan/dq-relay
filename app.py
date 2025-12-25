@@ -249,7 +249,6 @@ class RuleMapResponse(BaseModel):
     inputs: List[InputColumn]
     groups: List[List[Statement]]  # same shape as Streamlit Rule Builder
     dimension: Optional[str] = None
-    dimension: Optional[str] = None
 
 class NlpRuleMapRequest(BaseModel):
     text: str
@@ -1099,7 +1098,7 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             " - 'in {a,b,c}', 'one of', 'is within' map to operator 'is within' and Condition_Type 'function'.\n"
             " - 'not in' -> 'is not within'.\n"
             " - 'equals' -> 'is'; 'not equals' -> 'is not'; symbols (> ,>= ,< ,<=) map to the corresponding operators.\n"
-            " - Use the EXACT column names given in schema—do not invent columns.\n"
+            " - Prefer the schema column names. If the schema is empty, extract the column names from the user text.\n"
             " - If the text mentions trimming/stripping spaces, emit an expression that applies Trim/LTrim/RTrim BEFORE comparison.\n"
             " - For list values, keep them as a comma-separated string in Condition_Value (e.g., \"A, B, C\").\n"
             " - Include rule_name and rule_details if implied by the text; else leave them empty.\n"
