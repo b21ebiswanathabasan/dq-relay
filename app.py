@@ -1010,7 +1010,8 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
     """
     Convert NL into UI-ready Rule Builder groups & inferred Input Columns.
     - Structured Outputs first (Pydantic schema).
-    - Robust fallback (no 400) + heuristics for common NL (between, lists, uniqueness).
+    - Robust fallback (no 400) + heuristics for common NL (between, lists, uniqueness,
+      "greater than X and less than Y", and "not empty"/"not null").
     - Post-normalization: 'between' -> >= and <=, 'is within' -> function list, etc.
     - Trim/strip hardener upgrades string comparisons to expression with Trim+Upper.
     - Predicts 'dimension' via LLM; if missing, uses heuristics; always returns 'dimension'.
@@ -1023,7 +1024,7 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             [f"{c.get('name')}: {c.get('dtype','')}" for c in columns_in_schema if c.get("name")]
         )
 
-        # --- Tiny helpers local to this function --------------------------------
+        # --- Tiny helpers local to this function ---
         def _split_items_natural(raw: str) -> List[str]:
             s = (raw or "").strip().strip("{}")
             s = re.sub(r"\s+(?:and|AND)\s+", ",", s)
@@ -1036,57 +1037,141 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             statements: List[Statement] = []
             inputs_map: Dict[str, InputColumn] = {}
 
-            # between: "<col> between 30 & 60"
+            # (1) between: "<col> between A & B" -> two statements >=A and <=B
             m_between = re.search(
-                r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\bbetween\b\s*([+-]?\d+(?:\.\d+)?)\s*&\s*([+-]?\d+(?:\.\d+)?)",
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\bbetween\b\s*([+\-]?\d+(?:\.\d+)?)\s*&\s*([+\-]?\d+(?:\.\d+)?)",
                 _t, flags=re.IGNORECASE
             )
             if m_between:
                 col, a, b = m_between.group(1), m_between.group(2), m_between.group(3)
                 if (not cols_set) or (col in cols_set):
                     statements += [
-                        Statement(Column=col, Operator=Operator.is_greater_equal,
-                                  Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+", a) else ConditionType.float_value,
-                                  Condition_Value=a, DType="Float/Integer"),
-                        Statement(Column=col, Operator=Operator.is_less_equal,
-                                  Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+", b) else ConditionType.float_value,
-                                  Condition_Value=b, DType="Float/Integer")
+                        Statement(
+                            Column=col,
+                            Operator=Operator.is_greater_equal,
+                            Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+", a) else ConditionType.float_value,
+                            Condition_Value=a,
+                            DType="Float/Integer"
+                        ),
+                        Statement(
+                            Column=col,
+                            Operator=Operator.is_less_equal,
+                            Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+", b) else ConditionType.float_value,
+                            Condition_Value=b,
+                            DType="Float/Integer"
+                        ),
                     ]
                     inputs_map[col] = InputColumn(name=col, data_type="Integer", description="", max_length="")
 
-            # within: "<col> in Active, Live"
-            m_within = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\bin\b\s*\{?([A-Za-z0-9_ ,&]+)\}?", _t, flags=re.IGNORECASE)
+            # (2) domain: "<col> in A, B, C" or "{A, B, C}"
+            m_within = re.search(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\bin\b\s*\{?([A-Za-z0-9_ ,&]+)\}?",
+                _t, flags=re.IGNORECASE
+            )
             if m_within:
                 col, raw = m_within.group(1), m_within.group(2)
                 items = _split_items_natural(raw)
                 if items and ((not cols_set) or (col in cols_set)):
-                    statements.append(Statement(Column=col, Operator=Operator.is_within,
-                                               Condition_Type=ConditionType.function,
-                                               Condition_Value=", ".join(items), DType="String"))
+                    statements.append(Statement(
+                        Column=col,
+                        Operator=Operator.is_within,
+                        Condition_Type=ConditionType.function,
+                        Condition_Value=", ".join(items),
+                        DType="String"
+                    ))
                     inputs_map[col] = InputColumn(name=col, data_type="String", description="", max_length="")
 
-            # uniqueness: "<col> must be unique" or "no duplicates"
+            # (3) uniqueness: "<col> must be unique" / "no duplicates" / "distinct"
             uniq_hits = set()
             for sc in (cols_set or []):
                 if re.search(rf"\b{re.escape(sc)}\b[^.\n]*\b(unique|no\s+duplicates|distinct)\b", lower):
                     uniq_hits.add(sc)
             for col in uniq_hits:
                 statements.append(Statement(
-                    Column=col, Operator=Operator.is_, Condition_Type=ConditionType.expression,
-                    Condition_Value=f"IsUnique({col})", DType="String"   # <-- Template uses IsUnique()
+                    Column=col,
+                    Operator=Operator.is_,  # drive expression under 'is'
+                    Condition_Type=ConditionType.expression,
+                    Condition_Value=f"IsUnique({col})",  # matches your template
+                    DType="String"
                 ))
                 inputs_map[col] = InputColumn(name=col, data_type="String", description="", max_length="")
 
+            # --- NEW: (4) range phrase: "<col> greater than X and less than Y" (strict > and <) ---
+            m_range = re.search(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*greater\s+than\s+([+\-]?\d+(?:\.\d+)?)\s+and\s+less\s+than\s+([+\-]?\d+(?:\.\d+)?)",
+                _t, flags=re.IGNORECASE
+            )
+            if m_range:
+                col = m_range.group(1)
+                a = m_range.group(2)
+                b = m_range.group(3)
+                if (not cols_set) or (col in cols_set):
+                    statements.append(Statement(
+                        Column=col,
+                        Operator=Operator.is_greater_than,
+                        Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+", a) else ConditionType.float_value,
+                        Condition_Value=a,
+                        DType="Float/Integer"
+                    ))
+                    statements.append(Statement(
+                        Column=col,
+                        Operator=Operator.is_less_than,
+                        Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+", b) else ConditionType.float_value,
+                        Condition_Value=b,
+                        DType="Float/Integer"
+                    ))
+                    inputs_map[col] = InputColumn(name=col, data_type="Integer", description="", max_length="")
+
+            # --- NEW: (5) not empty / blank / empty string -> expression Trim(col) <> '' ---
+            m_not_empty = re.search(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\b(not\s+empty|non[-\s]*empty|blank|empty\s+string)\b",
+                _t, flags=re.IGNORECASE
+            )
+            if m_not_empty:
+                col_ne = m_not_empty.group(1)
+                if (not cols_set) or (col_ne in cols_set):
+                    statements.append(Statement(
+                        Column=col_ne,
+                        Operator=Operator.is_,
+                        Condition_Type=ConditionType.expression,
+                        Condition_Value=f"Trim({col_ne}) <> ''",
+                        DType="String"
+                    ))
+                    inputs_map[col_ne] = inputs_map.get(col_ne) or InputColumn(name=col_ne, data_type="String", description="", max_length="")
+
+            # --- NEW: (6) not null -> 'is not' + 'null value' ---
+            m_not_null = re.search(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\b[^.\n]*\bnot\s+null\b",
+                _t, flags=re.IGNORECASE
+            )
+            if m_not_null:
+                col_nn = m_not_null.group(1)
+                if (not cols_set) or (col_nn in cols_set):
+                    statements.append(Statement(
+                        Column=col_nn,
+                        Operator=Operator.is_not,
+                        Condition_Type=ConditionType.null_value,
+                        Condition_Value="",
+                        DType="String"
+                    ))
+                    inputs_map[col_nn] = inputs_map.get(col_nn) or InputColumn(name=col_nn, data_type="String", description="", max_length="")
+
             if statements:
-                return RuleMapResponse(rule_name="", rule_details="", inputs=list(inputs_map.values()), groups=[statements], dimension=None)
+                return RuleMapResponse(
+                    rule_name="",
+                    rule_details="",
+                    inputs=list(inputs_map.values()),
+                    groups=[statements],
+                    dimension=None
+                )
             return None
-        # ------------------------------------------------------------------------
 
         operator_list = [
             "contains", "is", "is not", "is within", "is not within",
             "is less than", "is less than or equal to", "is greater than", "is greater than or equal to",
         ]
 
+        # --- Prompt: prefer schema columns; if schema is empty, extract columns from user text ---
         prompt = (
             "You convert natural language DQ requirements into Rule Builder statements.\n"
             f"Valid operators: {operator_list}\n"
@@ -1098,7 +1183,8 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             " - 'in {a,b,c}', 'one of', 'is within' map to operator 'is within' and Condition_Type 'function'.\n"
             " - 'not in' -> 'is not within'.\n"
             " - 'equals' -> 'is'; 'not equals' -> 'is not'; symbols (> ,>= ,< ,<=) map to the corresponding operators.\n"
-            " - Prefer the schema column names. If the schema is empty, extract the column names from the user text.\n"
+            " - Prefer EXACT column names from the provided schema.\n"
+            " - IF THE SCHEMA'S COLUMN LIST IS EMPTY, you MAY EXTRACT column names from the user text (tokens or quoted identifiers).\n"
             " - If the text mentions trimming/stripping spaces, emit an expression that applies Trim/LTrim/RTrim BEFORE comparison.\n"
             " - For list values, keep them as a comma-separated string in Condition_Value (e.g., \"A, B, C\").\n"
             " - Include rule_name and rule_details if implied by the text; else leave them empty.\n"
@@ -1119,7 +1205,7 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             )
         )
 
-        # --- Fallback (no 400) ---
+        # --- Fallback (no 400): try raw text, fences, json; else heuristics ---
         if getattr(resp, "parsed", None) is None:
             raw_text = getattr(resp, "text", "") or ""
             if (not raw_text.strip()) and getattr(resp, "candidates", None):
@@ -1133,7 +1219,6 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                         )
                 except Exception:
                     pass
-
             if not raw_text.strip():
                 resp2 = genai_client.models.generate_content(
                     model="gemini-2.5-flash",
@@ -1154,14 +1239,15 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                         pass
 
             txt = _strip_code_fences(raw_text).strip()
-
             if not txt:
                 heur = _heuristic_rulemap_from_text(text, columns_in_schema)
                 parsed = heur if heur else RuleMapResponse(
                     rule_name="", rule_details="", inputs=[],
-                    groups=[[Statement(Column="", Operator=Operator.is_,
-                                       Condition_Type=ConditionType.expression,
-                                       Condition_Value="/* Fallback: model returned no JSON */", DType="String")]]
+                    groups=[[Statement(
+                        Column="", Operator=Operator.is_,
+                        Condition_Type=ConditionType.expression,
+                        Condition_Value="/* Fallback: model returned no JSON */", DType="String"
+                    )]]
                 )
             else:
                 try:
@@ -1171,9 +1257,11 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                     heur = _heuristic_rulemap_from_text(text, columns_in_schema)
                     parsed = heur if heur else RuleMapResponse(
                         rule_name="", rule_details="", inputs=[],
-                        groups=[[Statement(Column="", Operator=Operator.is_,
-                                           Condition_Type=ConditionType.expression,
-                                           Condition_Value="/* Fallback after parse error */", DType="String")]]
+                        groups=[[Statement(
+                            Column="", Operator=Operator.is_,
+                            Condition_Type=ConditionType.expression,
+                            Condition_Value="/* Fallback after parse error */", DType="String"
+                        )]]
                     )
         else:
             parsed: RuleMapResponse = resp.parsed
@@ -1184,21 +1272,21 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             norm_group: List[Statement] = []
             for stt in group:
                 op_norm = _norm_op(stt.Operator.value if isinstance(stt.Operator, Operator) else str(stt.Operator))
-                if op_norm == "is":                    op_enum = Operator.is_
-                elif op_norm == "is not":              op_enum = Operator.is_not
-                elif op_norm == "is within":           op_enum = Operator.is_within
-                elif op_norm == "is not within":       op_enum = Operator.is_not_within
-                elif op_norm == "is less than":        op_enum = Operator.is_less_than
+                if op_norm == "is": op_enum = Operator.is_
+                elif op_norm == "is not": op_enum = Operator.is_not
+                elif op_norm == "is within": op_enum = Operator.is_within
+                elif op_norm == "is not within": op_enum = Operator.is_not_within
+                elif op_norm == "is less than": op_enum = Operator.is_less_than
                 elif op_norm == "is less than or equal to": op_enum = Operator.is_less_equal
-                elif op_norm == "is greater than":     op_enum = Operator.is_greater_than
+                elif op_norm == "is greater than": op_enum = Operator.is_greater_than
                 elif op_norm == "is greater than or equal to": op_enum = Operator.is_greater_equal
-                elif op_norm == "contains":            op_enum = Operator.contains
-                else:                                  op_enum = Operator.is_
+                elif op_norm == "contains": op_enum = Operator.contains
+                else: op_enum = Operator.is_
 
                 col_name = (stt.Column or "").strip()
                 cond_val = (stt.Condition_Value or "").strip()
 
-                # 'between' -> two statements
+                # 'between ... and ...' inside Condition_Value -> split into two
                 if re.search(r"\bbetween\b", cond_val, flags=re.I):
                     m = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+)", cond_val, flags=re.I)
                     if m:
@@ -1207,29 +1295,37 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                         ct_a = _infer_numeric_type(a) or ("expression" if _is_iso_date(a) else "string value")
                         ct_b = _infer_numeric_type(b) or ("expression" if _is_iso_date(b) else "string value")
                         norm_group += [
-                            Statement(Column=col_name, Operator=Operator.is_greater_equal,
-                                      Condition_Type=ConditionType(_norm_condition_type(ct_a)),
-                                      Condition_Value=a, DType=hint_a),
-                            Statement(Column=col_name, Operator=Operator.is_less_equal,
-                                      Condition_Type=ConditionType(_norm_condition_type(ct_b)),
-                                      Condition_Value=b, DType=hint_b)
+                            Statement(
+                                Column=col_name, Operator=Operator.is_greater_equal,
+                                Condition_Type=ConditionType(_norm_condition_type(ct_a)),
+                                Condition_Value=a, DType=hint_a
+                            ),
+                            Statement(
+                                Column=col_name, Operator=Operator.is_less_equal,
+                                Condition_Type=ConditionType(_norm_condition_type(ct_b)),
+                                Condition_Value=b, DType=hint_b
+                            )
                         ]
                         continue
 
-                # within lists
+                # within lists -> function + comma-joined
                 if op_enum in (Operator.is_within, Operator.is_not_within):
                     items = _split_items_natural(cond_val) if cond_val else []
                     dtype_hint = _infer_list_dtype_hint(items) if items else "String"
-                    norm_group.append(Statement(Column=col_name, Operator=op_enum,
-                                                Condition_Type=ConditionType.function,
-                                                Condition_Value=", ".join(items), DType=dtype_hint))
+                    norm_group.append(Statement(
+                        Column=col_name, Operator=op_enum,
+                        Condition_Type=ConditionType.function,
+                        Condition_Value=", ".join(items), DType=dtype_hint
+                    ))
                     continue
 
                 # contains
                 if op_enum == Operator.contains:
-                    norm_group.append(Statement(Column=col_name, Operator=op_enum,
-                                                Condition_Type=ConditionType.string_value,
-                                                Condition_Value=cond_val, DType="String"))
+                    norm_group.append(Statement(
+                        Column=col_name, Operator=op_enum,
+                        Condition_Type=ConditionType.string_value,
+                        Condition_Value=cond_val, DType="String"
+                    ))
                     continue
 
                 # numeric/date comparisons
@@ -1238,13 +1334,15 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                     dtype_hint = _infer_scalar_dtype_hint(cond_val)
                     num_ct = _infer_numeric_type(cond_val)
                     ct_enum = ConditionType(_norm_condition_type(num_ct)) if num_ct \
-                              else (ConditionType.expression if _is_iso_date(cond_val) else ConditionType.string_value)
-                    norm_group.append(Statement(Column=col_name, Operator=op_enum,
-                                                Condition_Type=ct_enum,
-                                                Condition_Value=cond_val, DType=dtype_hint))
+                        else (ConditionType.expression if _is_iso_date(cond_val) else ConditionType.string_value)
+                    norm_group.append(Statement(
+                        Column=col_name, Operator=op_enum,
+                        Condition_Type=ct_enum,
+                        Condition_Value=cond_val, DType=dtype_hint
+                    ))
                     continue
 
-                # is / is not
+                # is / is not (null, timestamp, string, expression)
                 if op_enum in (Operator.is_, Operator.is_not):
                     lower_cv = cond_val.lower()
                     if lower_cv in ("null", "none", ""):
@@ -1255,24 +1353,27 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                         hint = _infer_scalar_dtype_hint(cond_val)
                         num_ct = _infer_numeric_type(cond_val)
                         ct_enum = ConditionType(_norm_condition_type(num_ct)) if num_ct \
-                                  else (ConditionType.expression if _is_iso_date(cond_val) else ConditionType.string_value)
+                            else (ConditionType.expression if _is_iso_date(cond_val) else ConditionType.string_value)
                         cv = cond_val
-                    norm_group.append(Statement(Column=col_name, Operator=op_enum,
-                                                Condition_Type=ct_enum, Condition_Value=cv, DType=hint))
+                    norm_group.append(Statement(
+                        Column=col_name, Operator=op_enum,
+                        Condition_Type=ct_enum, Condition_Value=cv, DType=hint
+                    ))
                     continue
 
+                # passthrough
                 norm_group.append(stt)
-
             normalized_groups.append(norm_group)
 
-        # --- Trim/strip hardener (regex fixed) ---
+        # --- Trim/strip hardener ---
         if re.search(r"\b(trim|strip|leading|trailing\s+spaces)\b", text, flags=re.IGNORECASE):
             for g_idx, g in enumerate(normalized_groups):
                 for s_idx, s in enumerate(g):
-                    if (s.DType or "String") != "String":  continue
+                    if (s.DType or "String") != "String":
+                        continue
                     col = (s.Column or "").strip()
-                    if not col:                             continue
-
+                    if not col:
+                        continue
                     if s.Operator in (Operator.is_within, Operator.is_not_within) and (s.Condition_Value or "").strip():
                         items = _split_items_natural(s.Condition_Value)
                         expr_items = ", ".join([f"'{v.upper()}'" for v in items]) if items else ""
@@ -1283,7 +1384,6 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                             DType="String"
                         )
                         continue
-
                     if s.Operator in (Operator.is_, Operator.is_not) and s.Condition_Type in (ConditionType.string_value, ConditionType.expression):
                         cv = (s.Condition_Value or "").strip()
                         if cv and cv.lower() not in ("null", "none", "current timestamp", "now", "today"):
@@ -1295,28 +1395,34 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                             )
                             continue
 
-        # --- Completer: add uniqueness statements if NL text requires it ---
-        uniq_needles = re.findall(r"['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\b[^.\n]*\b(unique|no\s+duplicates|distinct)\b", text, flags=re.IGNORECASE)
+        # --- Completer: add uniqueness if NL text requires it and not already present ---
+        uniq_needles = re.findall(
+            r"['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\b[^.\n]*\b(unique|no\s+duplicates|distinct)\b",
+            text, flags=re.IGNORECASE
+        )
         uniq_cols_from_text = {m[0] for m in uniq_needles}
         if uniq_cols_from_text:
-            existing_uniqs = {s.Column.strip() for g in normalized_groups for s in g
-                              if s.Condition_Type == ConditionType.expression and (s.Condition_Value or "").startswith("IsUnique(")}
+            existing_uniqs = {
+                s.Column.strip() for g in normalized_groups for s in g
+                if s.Condition_Type == ConditionType.expression and (s.Condition_Value or "").startswith("IsUnique(")
+            }
             for col in uniq_cols_from_text:
                 if col and col not in existing_uniqs:
-                    normalized_groups.append([
-                        Statement(Column=col, Operator=Operator.is_,
-                                  Condition_Type=ConditionType.expression,
-                                  Condition_Value=f"IsUnique({col})",    # <-- Template uses IsUnique()
-                                  DType="String")
-                    ])
+                    normalized_groups.append([Statement(
+                        Column=col, Operator=Operator.is_,
+                        Condition_Type=ConditionType.expression,
+                        Condition_Value=f"IsUnique({col})",
+                        DType="String"
+                    )])
 
-        # --- Build inputs ---
+        # --- Build inputs (promote dtype if seen multiple times) ---
         seen: Dict[str, InputColumn] = {}
         rank = {"Date/Time": 3, "Float": 2, "Integer": 2, "String": 1}
         for group in normalized_groups:
             for s in group:
                 col = (s.Column or "").strip()
-                if not col: continue
+                if not col:
+                    continue
                 hint = s.DType or "String"
                 dtype = _to_ui_dtype(hint)
                 cur = seen.get(col)
@@ -1330,7 +1436,6 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
         try:
             class DimChoice(BaseModel):
                 dimension: str  # one of ['Completeness','Uniqueness','Consistency','Accuracy','Timeliness','Integrity']
-
             dim_prompt = (
                 "Given the following rule statements, classify the primary Data Quality dimension "
                 "as one of: Completeness, Uniqueness, Consistency, Accuracy, Timeliness, Integrity.\n\n"
@@ -1342,8 +1447,10 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             dim_resp = genai_client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=dim_prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=DimChoice,
-                                                   temperature=0.0, max_output_tokens=64)
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json", response_schema=DimChoice,
+                    temperature=0.0, max_output_tokens=64
+                )
             )
             predicted_dim = getattr(dim_resp, "parsed", None).dimension if getattr(dim_resp, "parsed", None) else None
         except Exception:
@@ -1369,7 +1476,13 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             else:
                 predicted_dim = "Consistency"
 
-        out = RuleMapResponse(rule_name=parsed.rule_name, rule_details=parsed.rule_details, inputs=inputs, groups=normalized_groups, dimension=predicted_dim)
+        out = RuleMapResponse(
+            rule_name=parsed.rule_name,
+            rule_details=parsed.rule_details,
+            inputs=inputs,
+            groups=normalized_groups,
+            dimension=predicted_dim
+        )
         out_dict = jsonable_encoder(out, by_alias=True, exclude_none=True)
         out_dict["dimension"] = predicted_dim
         return out_dict
