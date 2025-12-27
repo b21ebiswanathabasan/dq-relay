@@ -28,6 +28,32 @@ from qdrant_client.http.models import (
     Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 )
 
+
+# --- Relevance knobs ---
+MAX_SOURCES = int(os.getenv("MAX_SOURCES", "6"))      # cap how many sources we return/display
+MIN_SCORE   = float(os.getenv("MIN_SCORE", "0.35"))   # drop weak matches (tune 0.30–0.50)
+
+def _filter_rank_sources(results):
+    """Deduplicate by (source_type, source_name, path_or_table), keep only high-score, top N."""
+    uniq = {}
+    for r in sorted(results, key=lambda x: x.score, reverse=True):
+        meta = r.payload.get("metadata", {}) or {}
+        key = (meta.get("source_type"), meta.get("source_name"), meta.get("path_or_table"))
+        if r.score < MIN_SCORE:
+            continue
+        if key in uniq:
+            continue
+        uniq[key] = {
+            "score": round(r.score, 3),
+            "source_type": meta.get("source_type"),
+            "source_name": meta.get("source_name"),
+            "path_or_table": meta.get("path_or_table"),
+        }
+        if len(uniq) >= MAX_SOURCES:
+            break
+    return list(uniq.values())
+
+
 # ------------------------------------------------------------------------------------
 # Env & configuration
 # ------------------------------------------------------------------------------------
@@ -196,7 +222,7 @@ class SmartRequest(BaseModel):
     schema: Optional["SchemaInput"] = None
     top_k: int = 12
     temperature: float = 0.2
-    max_output_tokens: int = 1024
+    max_output_tokens: int = 4096
 
 class SmartResponse(BaseModel):
     intent: Intent
@@ -590,10 +616,10 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         query_vector=("default", qvec),
         limit=max(1, req.top_k),
         with_payload=True,
-        score_threshold=None,
+        score_threshold=MIN_SCORE,
         query_filter=q_filter,
     )
-    sources = []
+    sources = _filter_rank_sources(results)
     for r in results:
         meta = r.payload.get("metadata", {})
         sources.append({
@@ -608,12 +634,10 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         "Prefer precise references to rules, profile fields, and execution outcomes."
     )
     context_block = "\n\n---\n\n".join(
-        f"[{r.payload.get('metadata', {}).get('source_type','doc')}] "
-        f"{r.payload.get('metadata', {}).get('source_name','')} "
-        f"{r.payload.get('metadata', {}).get('path_or_table','')}\n"
-        f"{r.payload.get('text','')}"
-        for r in results
-    ) if results else "No context."
+        f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n"
+        + (results_dict.get((s['source_type'], s['source_name'], s['path_or_table']), {}).get('text', ''))
+        for r in sources
+    ) if sources else "No context."
     user_prompt = (
         f"{system_prompt}\n\nContext:\n{context_block}\n\nUser question:\n{req.query}\n\n"
         "When you cite or refer, mention the source_type or rule names if present."
@@ -759,10 +783,10 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
         query_vector=("default", qvec),
         limit=max(1, req.top_k),
         with_payload=True,
-        score_threshold=None,
+        score_threshold=MIN_SCORE,
         query_filter=q_filter,
     )
-    sources = []
+    sources = _filter_rank_sources(results)
     for r in results:
         meta = r.payload.get("metadata", {})
         sources.append({
@@ -772,19 +796,17 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
             "path_or_table": meta.get("path_or_table"),
         })
     system_prompt = (
-        "You are a Data Quality analytics assistant. "
-        "Given context from data quality rules, profile reports, and cleansing runs, "
+        "You are a Data Quality analytics assistant. Use only provided context. "
+        "Return a short complete summary. Keep under ~300 words unlessa table is required.  "
         "generate clear analytics and summaries. "
         "Focus on aggregations, trends, and top-N style answers (e.g., top 10 failed rules). "
         "If the answer is not in the context, say you do not have that information."
     )
     context_block = "\n\n---\n\n".join(
-        f"[{r.payload.get('metadata', {}).get('source_type','doc')}] "
-        f"{r.payload.get('metadata', {}).get('source_name','')} "
-        f"{r.payload.get('metadata', {}).get('path_or_table','')}\n"
-        f"{r.payload.get('text','')}"
-        for r in results
-    ) if results else "No context."
+        f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n"
+        + (results_dict.get((s['source_type'], s['source_name'], s['path_or_table']), {}).get('text', ''))
+        for r in sources
+    ) if sources else "No context."
     user_prompt = (
         f"{system_prompt}\n\nContext:\n{context_block}\n\nAnalytics Question:\n{req.query}\n\nProvide structured insights."
     )
