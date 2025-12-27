@@ -33,6 +33,19 @@ from qdrant_client.http.models import (
 MAX_SOURCES = int(os.getenv("MAX_SOURCES", "6"))      # cap how many sources we return/display
 MIN_SCORE   = float(os.getenv("MIN_SCORE", "0.35"))   # drop weak matches (tune 0.30–0.50)
 
+def _index_result_text(results):
+    """
+    Return a dict keyed by (source_type, source_name, path_or_table) -> text
+    keeping the highest-score text for each key.
+    """
+    out = {}
+    for r in sorted(results, key=lambda x: x.score, reverse=True):
+        meta = r.payload.get("metadata", {}) or {}
+        key = (meta.get("source_type"), meta.get("source_name"), meta.get("path_or_table"))
+        if key not in out:
+            out[key] = r.payload.get("text", "")
+    return out
+
 def _filter_rank_sources(results):
     """Deduplicate by (source_type, source_name, path_or_table), keep only high-score, top N."""
     uniq = {}
@@ -129,7 +142,7 @@ class ChatRequest(BaseModel):
     query: str
     top_k: int = 6
     filters: Optional[Dict[str, Any]] = None
-    max_output_tokens: int = 1024
+    max_output_tokens: int = 4096   # was 1024
     temperature: float = 0.2
 
 class ChatResponse(BaseModel):
@@ -148,7 +161,7 @@ class AnalyticsRequest(BaseModel):
     query: str = Field(..., description="Analytics question, e.g. 'Top 10 failed dq rules for last 3 months'")
     top_k: int = 20
     filters: Optional[Dict[str, Any]] = None
-    max_output_tokens: int = 1024
+    max_output_tokens: int = 4096
     temperature: float = 0.2
 
 class AnalyticsResponse(BaseModel):
@@ -606,11 +619,13 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
     client.upsert(collection_name=QDRANT_COLLECTION, points=points)
     return {"upserted": len(points)}
 
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, _: None = Depends(check_auth)):
     client = get_qdrant()
     qvec = embed_query(req.query)
     q_filter = build_filter(req.filters)
+
     results = client.search(
         collection_name=QDRANT_COLLECTION,
         query_vector=("default", qvec),
@@ -619,29 +634,33 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         score_threshold=MIN_SCORE,
         query_filter=q_filter,
     )
+
+    # Filter & dedup
     sources = _filter_rank_sources(results)
-    for r in results:
-        meta = r.payload.get("metadata", {})
-        sources.append({
-            "score": r.score,
-            "source_type": meta.get("source_type"),
-            "source_name": meta.get("source_name"),
-            "path_or_table": meta.get("path_or_table"),
-        })
+
+    # Build text index once (highest-scoring text per key)
+    results_dict = _index_result_text(results)
+
     system_prompt = (
         "You are a data quality assistant. Answer using only the provided context. "
         "If the answer is not in context, say you do not have that information. "
         "Prefer precise references to rules, profile fields, and execution outcomes."
     )
+
     context_block = "\n\n---\n\n".join(
         f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n"
-        + (results_dict.get((s['source_type'], s['source_name'], s['path_or_table']), {}).get('text', ''))
-        for r in sources
+        + results_dict.get(
+            (s.get('source_type'), s.get('source_name'), s.get('path_or_table')),
+            ""
+        )
+        for s in sources
     ) if sources else "No context."
+
     user_prompt = (
         f"{system_prompt}\n\nContext:\n{context_block}\n\nUser question:\n{req.query}\n\n"
         "When you cite or refer, mention the source_type or rule names if present."
     )
+
     resp = genai_client.models.generate_content(
         model=GEN_MODEL,
         contents=user_prompt,
@@ -650,13 +669,17 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
             temperature=req.temperature
         )
     )
+
     answer = getattr(resp, "text", "") or ""
     if not answer and getattr(resp, "candidates", None):
         cand = resp.candidates[0]
         if getattr(cand, "content", None) and getattr(cand.content, "parts", None):
             answer = "".join(p.text for p in cand.content.parts if hasattr(p, "text"))
     if not answer:
-        answer = "I don't have sufficient indexed context to answer that yet. Please load your reports or rules via /upsert_batch."
+        answer = ("I don't have sufficient indexed context to answer that yet. "
+                  "Please load your reports or rules via /upsert_batch.")
+
+    # IMPORTANT: return only filtered 'sources'
     return ChatResponse(answer=answer, sources=sources)
 
 
@@ -773,43 +796,47 @@ def _gen_strict_json(client, model: str, prompt: str, max_tokens: int, temperatu
             text = "".join(getattr(p, "text", "") for p in cand.content.parts if hasattr(p, "text"))
     return _strip_code_fences(text).strip()
 
+
+
 @app.post("/analytics", response_model=AnalyticsResponse)
 def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     client = get_qdrant()
     qvec = embed_query(req.query)
     q_filter = build_filter(req.filters)
+
     results = client.search(
         collection_name=QDRANT_COLLECTION,
         query_vector=("default", qvec),
-        limit=max(1, req.top_k),
+        limit=max(1, req.top_k),     # don't force 20 here
         with_payload=True,
         score_threshold=MIN_SCORE,
         query_filter=q_filter,
     )
+
     sources = _filter_rank_sources(results)
-    for r in results:
-        meta = r.payload.get("metadata", {})
-        sources.append({
-            "score": r.score,
-            "source_type": meta.get("source_type"),
-            "source_name": meta.get("source_name"),
-            "path_or_table": meta.get("path_or_table"),
-        })
+    results_dict = _index_result_text(results)
+
     system_prompt = (
-        "You are a Data Quality analytics assistant. Use only provided context. "
-        "Return a short complete summary. Keep under ~300 words unlessa table is required.  "
-        "generate clear analytics and summaries. "
-        "Focus on aggregations, trends, and top-N style answers (e.g., top 10 failed rules). "
+        "You are a Data Quality analytics assistant. Use only the provided context. "
+        "Return a short, complete summary. Keep under ~300 words unless a table is required. "
+        "Focus on aggregations, trends, and top‑N style answers (e.g., top 10 failed rules). "
         "If the answer is not in the context, say you do not have that information."
     )
+
     context_block = "\n\n---\n\n".join(
         f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n"
-        + (results_dict.get((s['source_type'], s['source_name'], s['path_or_table']), {}).get('text', ''))
-        for r in sources
+        + results_dict.get(
+            (s.get('source_type'), s.get('source_name'), s.get('path_or_table')),
+            ""
+        )
+        for s in sources
     ) if sources else "No context."
+
     user_prompt = (
-        f"{system_prompt}\n\nContext:\n{context_block}\n\nAnalytics Question:\n{req.query}\n\nProvide structured insights."
+        f"{system_prompt}\n\nContext:\n{context_block}\n\n"
+        f"Analytics Question:\n{req.query}\n\nProvide structured insights."
     )
+
     resp = genai_client.models.generate_content(
         model="gemini-2.5-flash",
         contents=user_prompt,
@@ -818,6 +845,7 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
             temperature=req.temperature
         )
     )
+
     analysis = getattr(resp, "text", "") or ""
     if not analysis and getattr(resp, "candidates", None):
         cand = resp.candidates[0]
@@ -828,6 +856,7 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
             analysis = cand.content
     if not analysis:
         analysis = "No analytics could be generated from the current context."
+
     return AnalyticsResponse(analysis=analysis, sources=sources)
 
 @app.post("/nlp_rule_create", response_model=List[RuleModel])
@@ -891,7 +920,7 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
     if intent == Intent.analytics:
         resp = analytics(AnalyticsRequest(
             query=req.query,
-            top_k=max(20, req.top_k),
+            top_k=max(1, req.top_k),
             filters=req.filters,
             temperature=req.temperature,
             max_output_tokens=req.max_output_tokens
