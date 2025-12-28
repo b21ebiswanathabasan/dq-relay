@@ -18,7 +18,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field, validator
 
 from dateutil.parser import parse as dt_parse  # ensure python-dateutil in requirements
-
+from qdrant_client.http.models import PayloadSchemaType
 # NEW SDK (one SDK for gen content + structured outputs + embeddings)
 from google import genai
 from google.genai import types
@@ -29,6 +29,34 @@ from qdrant_client.http.models import (
 )
 
 import re
+
+def ensure_payload_indexes(client: QdrantClient):
+    """
+    Create payload indexes for fields we use in filters.
+    Safe to call on every startup; it only creates missing indexes.
+    """
+    fields = [
+        "metadata.source_type",
+        "metadata.source_name",
+        "metadata.path_or_table",
+        "metadata.extra.run_id",       # helpful for run-scoped queries
+        # Optional (if you plan to filter by these later):
+        # "metadata.extra.report_name",
+        # "metadata.extra.rule_names",  # arrays are supported; treated as keyword list
+    ]
+    for field in fields:
+        try:
+            client.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name=field,
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+        except Exception as e:
+            # Ignore "already exists" errors; log others for visibility
+            msg = str(e).lower()
+            if "already" in msg or "exists" in msg:
+                continue
+            print(f"[startup] payload index creation warning for {field}: {e}")
 
 def _soft_contains(hay: str, needle: str) -> bool:
     return needle.lower() in (hay or "").lower()
@@ -692,6 +720,7 @@ def startup():
     client = get_qdrant()
     # text-embedding-004 => 768 dims; if you use gemini-embedding-001, raise dim
     ensure_collection(client, dim=768)
+    ensure_payload_indexes(client)
 
 @app.get("/health")
 def health():
