@@ -28,7 +28,34 @@ from qdrant_client.http.models import (
     Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 )
 
+import re
 
+def _soft_contains(hay: str, needle: str) -> bool:
+    return needle.lower() in (hay or "").lower()
+
+def query_driven_filters(query: str) -> Dict[str, Any]:
+    q = (query or "").lower()
+    filters = {}
+
+    # Inventory of available DQ rules -> prefer dq_rules catalog
+    if re.search(r"\bhow many\b.*\bdq rules\b|\bavailable\b.*\bdq rules\b", q):
+        filters["source_type"] = ["dq_rules"]  # OR list allowed in build_filter()
+
+    # Top-N failed rules -> prefer dq_run_report & summary (not profile)
+    if re.search(r"\btop\b.*\bfailed rule(s)?\b", q):
+        filters["source_type"] = ["dq_run_report"]
+
+    # Profile-applied rules -> prefer profile_summary sources
+    if re.search(r"\brules applied\b.*\bprofile\b", q):
+        filters["source_type"] = ["profile_summary"]
+
+    return filters
+
+def nudge_intent_for_analytics(query: str) -> bool:
+    q = (query or "").lower()
+    keys = ["top ", "failed rule", "failed rules", "trend", "distribution", "aggregate", "summary",
+            "count of failures", "percent null", "grouped by"]
+    return any(k in q for k in keys)
 # --- Relevance knobs ---
 MAX_SOURCES = int(os.getenv("MAX_SOURCES", "6"))      # cap how many sources we return/display
 MIN_SCORE   = float(os.getenv("MIN_SCORE", "0.35"))   # drop weak matches (tune 0.30–0.50)
@@ -671,12 +698,13 @@ def health():
     return {"status": "ok", "time": time.time()}
 
 
+
 @app.post("/upsert_batch")
 def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
     client = get_qdrant()
     points: List[PointStruct] = []
 
-    # Helper: KV text → dict
+    # KV -> JSON normalization
     def _kvtext_to_json(text: str) -> Dict[str, Any]:
         out = {}
         for line in (text or "").splitlines():
@@ -695,8 +723,7 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
         md: Metadata = item.metadata or Metadata()
         md.timestamp = md.timestamp or time.time()
 
-        # Try to detect DQ run meta (JSON or KV-text) and enrich metadata
-        summary_chunk = None
+        # Attempt to parse into an object
         obj = None
         try:
             if item.text.strip().startswith("{"):
@@ -706,29 +733,25 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
         except Exception:
             obj = None
 
-        # Heuristic: treat any object with run_id & report_name as a DQ run meta
+        # Enrich DQ run meta (JSON or KV) so analytics can use contributions/dimensions
+        summary_chunk = None
         if isinstance(obj, dict) and obj.get("run_id") and obj.get("report_name"):
             run_id      = obj.get("run_id")
             report_name = obj.get("report_name")
             rule_names  = obj.get("rule_names") or []
             overall_dq  = obj.get("overall_dq")
-
-            md.source_type   = md.source_type   or "dq_run_report"
-            md.source_name   = md.source_name   or f"{report_name} (Run {run_id})"
-            md.path_or_table = md.path_or_table or md.path_or_table
-            md.extra = (md.extra or {})
+            md.source_type = md.source_type or "dq_run_report"
+            md.source_name = md.source_name or f"{report_name} (Run {run_id})"
+            md.extra       = (md.extra or {})
             md.extra.update({
                 "run_id": run_id,
                 "report_name": report_name,
                 "rule_names": rule_names,
                 "overall_dq": overall_dq,
-                # If present, preserve additional analytics fields
-                "rule_scores":            obj.get("rule_scores"),
-                "rule_overall_contrib":   obj.get("rule_overall_contrib"),
-                "dimension_counts_map":   obj.get("dimension_counts_map"),
+                "rule_scores":          obj.get("rule_scores"),
+                "rule_overall_contrib": obj.get("rule_overall_contrib"),
+                "dimension_counts_map": obj.get("dimension_counts_map"),
             })
-
-            # Optional: prepend a human-friendly summary chunk to boost relevance
             preview_names = ", ".join(rule_names[:6]) if rule_names else ""
             summary_chunk = (
                 f"Report: {report_name}\n"
@@ -737,12 +760,10 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
                 f"Rules: {preview_names}"
             )
 
-        # Chunk the text (prepend summary if present)
+        # Chunking with optional summary
         chunks = []
         if summary_chunk:
             chunks.append(summary_chunk)
-
-        # Basic chunker (using tokens split) — keep your existing function if preferred
         tokens = item.text.split()
         i = 0
         while i < len(tokens):
@@ -759,10 +780,7 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
                 PointStruct(
                     id=pid,
                     vector={"default": vec},
-                    payload={
-                        "text": chunk,
-                        "metadata": md.dict(exclude_none=True),
-                    },
+                    payload={"text": chunk, "metadata": md.dict(exclude_none=True)},
                 )
             )
 
@@ -775,9 +793,15 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
 def chat(req: ChatRequest, _: None = Depends(check_auth)):
     client   = get_qdrant()
     qvec     = embed_query(req.query)
-    q_filter = build_filter(req.filters)
+    # Merge UI filters with query-driven filters
+    qf       = query_driven_filters(req.query)
+    merged   = dict(req.filters or {})
+    # Only merge if the query-driven filter explicitly sets source_type
+    if qf.get("source_type"):
+        merged["source_type"] = qf["source_type"]
+    q_filter = build_filter(merged)
 
-    # Primary search with threshold & filters
+    # Primary search
     results = client.search(
         collection_name=QDRANT_COLLECTION,
         query_vector=("default", qvec),
@@ -786,8 +810,7 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
         score_threshold=MIN_SCORE,
         query_filter=q_filter,
     )
-
-    # Fallback #1: if the search returns empty (over-filtering or borderline score), retry without filters at lower threshold
+    # Recall fallback
     if not results:
         results = client.search(
             collection_name=QDRANT_COLLECTION,
@@ -798,54 +821,41 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
             query_filter=None,
         )
 
-    # Filter & dedup sources using our gating logic
+    # Gate sources (chat mode; profile excluded unless asked)
     sources = _filter_rank_sources(results, intent="chat", query=req.query)
 
-    # Fallback #2: if filtered sources are empty but we had raw results, re-run rank with wants_profile=True by adding the word 'profile'
-    if not sources and results:
-        sources = _filter_rank_sources(results, intent="chat", query=req.query + " profile")
-
-    # Prepare run-meta and highest-text lookup for context assembly
     run_meta_by_id = _collect_run_meta(results)
     results_dict   = _index_result_text(results)
 
-    # Context builder with summary.csv rewrite if run_id present
-    def _context_text_for_source(s):
+    def _ctx(s):
         key = (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id'))
         raw = results_dict.get(key, "")
         pt  = (s.get('path_or_table') or "").lower()
         if pt.endswith("summary.csv"):
-            run_id = s.get("run_id")
-            if run_id and run_id in run_meta_by_id:
-                return _rewrite_summary_csv(raw, run_meta_by_id[run_id])
+            rid = s.get("run_id")
+            if rid and rid in run_meta_by_id:
+                return _rewrite_summary_csv(raw, run_meta_by_id[rid])
         return raw
 
     system_prompt = (
         "You are a data quality assistant. Answer using only the provided context. "
-        "Prefer precise references to rules, profile fields, and execution outcomes. "
         "If the answer is not in context, say you do not have that information."
     )
 
     context_block = "\n\n---\n\n".join(
-        f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n" +
-        _context_text_for_source(s)
+        f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n" + _ctx(s)
         for s in sources
     ) if sources else "No context."
 
     user_prompt = (
-        f"{system_prompt}\n\n"
-        f"Context:\n{context_block}\n\n"
-        f"User question:\n{req.query}\n\n"
+        f"{system_prompt}\n\nContext:\n{context_block}\n\nUser question:\n{req.query}\n"
         "When you cite or refer, mention the source_type or rule names if present."
     )
 
     resp = genai_client.models.generate_content(
         model=os.getenv("GEN_MODEL","gemini-2.5-flash"),
         contents=user_prompt,
-        config=types.GenerateContentConfig(
-            max_output_tokens=req.max_output_tokens,
-            temperature=req.temperature
-        )
+        config=types.GenerateContentConfig(max_output_tokens=req.max_output_tokens, temperature=req.temperature)
     )
     answer = getattr(resp, "text", "") or ""
     if not answer and getattr(resp, "candidates", None):
@@ -858,7 +868,6 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
             "I don't have sufficient indexed context to answer that yet. "
             "Please load your DQ reports or rules via /upsert_batch."
         )
-
     return ChatResponse(answer=answer, sources=sources)
 @app.post("/recommend", response_model=RecommendationResponse)
 def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
@@ -871,7 +880,8 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
     if mode == "DQ_RULES":
         prompt = _strong_json_rules_prompt(req.profile_summary)
         json_text = _gen_strict_json(
-            genai_client, model=os.getenv("GEN_MODEL", "gemini-2.5-flash"),
+            
+			, model=os.getenv("GEN_MODEL", "gemini-2.5-flash"),
             prompt=prompt, max_tokens=req.max_output_tokens, temperature=0.2
         )
         if not json_text or not json_text.strip().startswith("{"):
@@ -997,80 +1007,67 @@ def _collect_run_meta(results):
             except Exception:
                 pass
     return out
+
 @app.post("/analytics", response_model=AnalyticsResponse)
 def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     client   = get_qdrant()
     qvec     = embed_query(req.query)
-    q_filter = build_filter(req.filters)
+    # Merge UI filters with query-driven filters
+    qf       = query_driven_filters(req.query)
+    merged   = dict(req.filters or {})
+    if qf.get("source_type"):
+        merged["source_type"] = qf["source_type"]
+    q_filter = build_filter(merged)
 
-    # Primary search with threshold & filters
     results = client.search(
         collection_name=QDRANT_COLLECTION,
         query_vector=("default", qvec),
-        limit=max(1, req.top_k),            # your UI sets top_k; /smart will force min 20 (see snippet below)
+        limit=max(20, req.top_k),  # restore min 20 for analytics recall
         with_payload=True,
         score_threshold=MIN_SCORE,
         query_filter=q_filter,
     )
-
-    # Fallback #1: as in /chat
     if not results:
         results = client.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=("default", qvec),
-            limit=max(1, req.top_k),
+            limit=max(20, req.top_k),
             with_payload=True,
             score_threshold=max(0.20, MIN_SCORE * 0.8),
             query_filter=None,
         )
 
-    # Filter & dedup sources with analytics gating (prefer DQ; exclude profile unless asked)
     sources = _filter_rank_sources(results, intent="analytics", query=req.query)
-
-    # Fallback #2: if filtered sources empty but results exist, try with wants_profile=True
-    if not sources and results:
-        sources = _filter_rank_sources(results, intent="analytics", query=req.query + " profile")
 
     run_meta_by_id = _collect_run_meta(results)
     results_dict   = _index_result_text(results)
 
-    def _context_text_for_source(s):
+    def _ctx(s):
         key = (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id'))
         raw = results_dict.get(key, "")
         pt  = (s.get('path_or_table') or "").lower()
         if pt.endswith("summary.csv"):
-            run_id = s.get("run_id")
-            if run_id and run_id in run_meta_by_id:
-                return _rewrite_summary_csv(raw, run_meta_by_id[run_id])
+            rid = s.get("run_id")
+            if rid and rid in run_meta_by_id:
+                return _rewrite_summary_csv(raw, run_meta_by_id[rid])
         return raw
 
     system_prompt = (
         "You are a Data Quality analytics assistant. Use only the provided context. "
-        "Return a short, complete summary. Keep under ~300 words unless a table is required. "
-        "Focus on aggregations, trends, and top‑N answers (e.g., top 10 failed rules). "
-        "If the answer is not in the context, say you do not have that information."
+        "Return a short, complete summary. Focus on aggregations, trends, and top‑N answers."
     )
 
     context_block = "\n\n---\n\n".join(
-        f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n" +
-        _context_text_for_source(s)
+        f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n" + _ctx(s)
         for s in sources
     ) if sources else "No context."
 
-    user_prompt = (
-        f"{system_prompt}\n\n"
-        f"Context:\n{context_block}\n\n"
-        f"Analytics Question:\n{req.query}\n\n"
-        "Provide structured insights."
-    )
+    user_prompt = f"{system_prompt}\n\nContext:\n{context_block}\n\nQuestion:\n{req.query}\n"
 
     resp = genai_client.models.generate_content(
         model=os.getenv("GEN_MODEL","gemini-2.5-flash"),
         contents=user_prompt,
-        config=types.GenerateContentConfig(
-            max_output_tokens=req.max_output_tokens,
-            temperature=req.temperature
-        )
+        config=types.GenerateContentConfig(max_output_tokens=req.max_output_tokens, temperature=req.temperature)
     )
     analysis = getattr(resp, "text", "") or ""
     if not analysis and getattr(resp, "candidates", None):
@@ -1083,7 +1080,6 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
 
     if not analysis:
         analysis = "No analytics could be generated from the current context."
-
     return AnalyticsResponse(analysis=analysis, sources=sources)
 @app.post("/nlp_rule_create", response_model=List[RuleModel])
 def nlp_rule_create(req: NlpRuleCreateRequest, _: None = Depends(check_auth)):
@@ -1132,9 +1128,13 @@ def _classify_intent_structured(query: str) -> Intent:
         return Intent.chat
 
 
+
 @app.post("/smart", response_model=SmartResponse)
 def smart(req: SmartRequest, _: None = Depends(check_auth)):
     intent = _classify_intent_structured(req.query)
+    if nudge_intent_for_analytics(req.query):  # force analytics for top-N failure style questions
+        intent = Intent.analytics
+
     if intent == Intent.chat:
         resp = chat(ChatRequest(
             query=req.query, top_k=max(1, req.top_k),
@@ -1145,7 +1145,7 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
     if intent == Intent.analytics:
         resp = analytics(AnalyticsRequest(
             query=req.query,
-            top_k=max(20, req.top_k),  # ← restore min 20 for analytics recall
+            top_k=max(20, req.top_k),
             filters=req.filters, temperature=req.temperature, max_output_tokens=req.max_output_tokens
         ))
         return SmartResponse(intent=intent, analysis=resp.analysis, sources=resp.sources)
