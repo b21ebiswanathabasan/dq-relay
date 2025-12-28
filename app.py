@@ -37,6 +37,66 @@ MIN_SCORE   = float(os.getenv("MIN_SCORE", "0.35"))   # drop weak matches (tune 
 DQ_TYPES    = {"dq_run_report", "dq_rules"}
 PROFILE_TYPES = {"profile_report", "profile_summary", "profile_recommendation"}
 
+def _collect_run_meta(results):
+    """
+    Scan results for dq_run_report JSON (meta.json-like) and return:
+      run_meta_by_id[run_id] = {"rule_names": [...], "rule_scores": [...]}
+    """
+    out = {}
+    for r in results:
+        meta = r.payload.get("metadata", {}) or {}
+        st = (meta.get("source_type") or "").lower()
+        if st != "dq_run_report":
+            continue
+        text = r.payload.get("text", "") or ""
+        # meta.json-like payloads are JSON text
+        if text.strip().startswith("{"):
+            try:
+                obj = json.loads(text)
+                if isinstance(obj, dict) and obj.get("run_id"):
+                    out[obj["run_id"]] = {
+                        "rule_names": obj.get("rule_names") or [],
+                        "rule_scores": obj.get("rule_scores") or []
+                    }
+            except Exception:
+                pass
+    return out
+
+
+def _rewrite_summary_csv(text: str, run_meta: Dict[str, Any]) -> str:
+    """
+    If text looks like the summary.csv with 'Rule' column (Rule 1/Rule 2/...),
+    replace with actual rule_names using the order from run_meta['rule_names'].
+    """
+    t = (text or "").strip()
+    if not t or "Rule" not in t.splitlines()[0]:
+        return text  # not a 'Rule' header CSV
+
+    rule_names = run_meta.get("rule_names") or []
+    if not rule_names:
+        return text
+
+    lines = t.splitlines()
+    out_lines = []
+    for i, line in enumerate(lines):
+        if i == 0:
+            out_lines.append(line)  # header unchanged
+            continue
+        # CSV rows begin with something like: "Rule 1,95.9,4.1,..."
+        parts = [p.strip() for p in line.split(",")]
+        if not parts:
+            out_lines.append(line); continue
+        first = parts[0]
+        m = re.match(r"Rule\s+(\d+)", first, flags=re.IGNORECASE)
+        if m:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(rule_names):
+                parts[0] = rule_names[idx]
+                out_lines.append(",".join(parts))
+                continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
 def _summarize_payload_text(text: str) -> str:
     t = (text or "").strip()
     if not t:
@@ -657,7 +717,17 @@ def startup():
 def health():
     return {"status": "ok", "time": time.time()}
 
-
+def _context_text_for_source(s):
+    # key includes run_id (from earlier patch)
+    key = (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id'))
+    raw = results_dict.get(key, "")
+    # If this source is a summary.csv for a run, rewrite rule labels
+    pt = (s.get('path_or_table') or "").lower()
+    if pt.endswith("summary.csv"):
+        run_id = s.get("run_id")
+        if run_id and run_id in run_meta_by_id:
+            return _rewrite_summary_csv(raw, run_meta_by_id[run_id])
+    return raw
 @app.post("/upsert_batch")
 def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
     client = get_qdrant()
@@ -742,8 +812,18 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
     # Filter & dedup
     sources = _filter_rank_sources(results, intent="chat", query=req.query)
 
-    # Build text index once (highest-scoring text per key)
+    run_meta_by_id = _collect_run_meta(results)
     results_dict = _index_result_text(results)
+	
+    def _context_text_for_source(s):
+        key = (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id'))
+        raw = results_dict.get(key, "")
+        pt = (s.get('path_or_table') or "").lower()
+        if pt.endswith("summary.csv"):
+            run_id = s.get("run_id")
+            if run_id and run_id in run_meta_by_id:
+                return _rewrite_summary_csv(raw, run_meta_by_id[run_id])
+        return raw
 
     system_prompt = (
         "You are a data quality assistant. Answer using only the provided context. "
@@ -753,10 +833,7 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
 
     context_block = "\n\n---\n\n".join(
         f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n"
-        + _summarize_payload_text ( results_dict.get(
-            (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id')),
-            ""
-        ))
+        + _context_text_for_source(s)
         for s in sources
     ) if sources else "No context."
 
@@ -918,7 +995,19 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     )
 
     sources = _filter_rank_sources(results, intent="analytics", query=req.query)
+
+    run_meta_by_id = _collect_run_meta(results)
     results_dict = _index_result_text(results)
+	
+    def _context_text_for_source(s):
+        key = (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id'))
+        raw = results_dict.get(key, "")
+        pt = (s.get('path_or_table') or "").lower()
+        if pt.endswith("summary.csv"):
+            run_id = s.get("run_id")
+            if run_id and run_id in run_meta_by_id:
+                return _rewrite_summary_csv(raw, run_meta_by_id[run_id])
+        return raw
 
     system_prompt = (
         "You are a Data Quality analytics assistant. Use only the provided context. "
@@ -929,10 +1018,7 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
 
     context_block = "\n\n---\n\n".join(
         f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n"
-        + results_dict.get(
-            (s.get('source_type'), s.get('source_name'), s.get('path_or_table')),
-            ""
-        )
+        + _context_text_for_source(s)
         for s in sources
     ) if sources else "No context."
 
