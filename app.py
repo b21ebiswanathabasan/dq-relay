@@ -186,7 +186,7 @@ class ChatResponse(BaseModel):
 
 class RecommendationRequest(BaseModel):
     profile_summary: str = Field(..., description="Data profile summary text from Streamlit app")
-    max_output_tokens: int = 1024
+    max_output_tokens: int = 4096
     temperature: float = 0.3
 
 class RecommendationResponse(BaseModel):
@@ -880,8 +880,7 @@ def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
     if mode == "DQ_RULES":
         prompt = _strong_json_rules_prompt(req.profile_summary)
         json_text = _gen_strict_json(
-            
-			, model=os.getenv("GEN_MODEL", "gemini-2.5-flash"),
+            genai_client, model=os.getenv("GEN_MODEL", "gemini-2.5-flash"),
             prompt=prompt, max_tokens=req.max_output_tokens, temperature=0.2
         )
         if not json_text or not json_text.strip().startswith("{"):
