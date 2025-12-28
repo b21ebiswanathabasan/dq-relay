@@ -33,25 +33,75 @@ from qdrant_client.http.models import (
 MAX_SOURCES = int(os.getenv("MAX_SOURCES", "6"))      # cap how many sources we return/display
 MIN_SCORE   = float(os.getenv("MIN_SCORE", "0.35"))   # drop weak matches (tune 0.30–0.50)
 
-def _index_result_text(results):
-    """
-    Return a dict keyed by (source_type, source_name, path_or_table) -> text
-    keeping the highest-score text for each key.
-    """
-    out = {}
-    for r in sorted(results, key=lambda x: x.score, reverse=True):
-        meta = r.payload.get("metadata", {}) or {}
-        key = (meta.get("source_type"), meta.get("source_name"), meta.get("path_or_table"))
-        if key not in out:
-            out[key] = r.payload.get("text", "")
-    return out
 
-def _filter_rank_sources(results):
-    """Deduplicate by (source_type, source_name, path_or_table), keep only high-score, top N."""
+DQ_TYPES    = {"dq_run_report", "dq_rules"}
+PROFILE_TYPES = {"profile_report", "profile_summary", "profile_recommendation"}
+
+def _summarize_payload_text(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # If it looks like JSON, try to extract DQ fields
+    if t.startswith("{") or t.startswith("["):
+        try:
+            obj = json.loads(t)
+            if isinstance(obj, dict):
+                report_name = obj.get("report_name")
+                run_id = obj.get("run_id")
+                overall_dq = obj.get("overall_dq")
+                rule_names = obj.get("rule_names") or []
+                if report_name or run_id or rule_names or overall_dq is not None:
+                    rn = ", ".join(rule_names[:6])
+                    return (
+                        f"Report: {report_name or ''} | Run: {run_id or ''} | Overall DQ: {overall_dq if overall_dq is not None else ''}\n"
+                        f"Rules: {rn}"
+                    ).strip()
+        except Exception:
+            pass
+    return t  # fallback: plain text
+
+def _should_include(meta: Dict[str, Any], *, intent: str, query: str) -> bool:
+    st = (meta.get("source_type") or "").lower()
+    sn = (meta.get("source_name") or "").lower()
+    pt = (meta.get("path_or_table") or "").lower()
+    q  = (query or "").lower()
+
+    # If user explicitly asks about profile/cleansing, allow profile sources
+    wants_profile = any(w in q for w in ["profile", "cleanse", "cleansing", "recommendation"])
+
+    if intent == "analytics":
+        if wants_profile:
+            return (st in PROFILE_TYPES) or ("profile" in sn) or ("profile" in pt)
+        # Prefer DQ run/report/rules, drop obvious noise like run_results_* & profile-recommendation
+        if sn.startswith("run_results_") or "run_results_" in pt:
+            return False
+        if "profile-recommendation" in sn or "profile-recommendation" in pt:
+            return False
+        return (st in DQ_TYPES) or ("meta.json" in sn) or ("report.json" in sn)
+
+    if intent == "chat":
+        # Basic chat: keep almost everything but still drop profile-recommendation unless asked
+        if not wants_profile and ("profile-recommendation" in sn or "profile-recommendation" in pt):
+            return False
+        return True
+
+    # Default: allow
+    return True
+
+
+def _filter_rank_sources(results, *, intent: str = "", query: str = ""):
+    """Deduplicate & filter to relevant sources."""
     uniq = {}
     for r in sorted(results, key=lambda x: x.score, reverse=True):
         meta = r.payload.get("metadata", {}) or {}
-        key = (meta.get("source_type"), meta.get("source_name"), meta.get("path_or_table"))
+        extra = meta.get("extra") or {}
+        run_id = extra.get("run_id")
+        key = (meta.get("source_type"), meta.get("source_name"), meta.get("path_or_table"), run_id)
+
+        # Relevance gate (see section C below)
+        if not _should_include(meta, intent=intent, query=query):
+            continue
+
         if r.score < MIN_SCORE:
             continue
         if key in uniq:
@@ -61,10 +111,24 @@ def _filter_rank_sources(results):
             "source_type": meta.get("source_type"),
             "source_name": meta.get("source_name"),
             "path_or_table": meta.get("path_or_table"),
+            "run_id": run_id,
         }
         if len(uniq) >= MAX_SOURCES:
             break
     return list(uniq.values())
+
+
+def _index_result_text(results):
+    """Highest-score text per (type, name, path, run_id)."""
+    out = {}
+    for r in sorted(results, key=lambda x: x.score, reverse=True):
+        meta = r.payload.get("metadata", {}) or {}
+        extra = meta.get("extra") or {}
+        run_id = extra.get("run_id")
+        key = (meta.get("source_type"), meta.get("source_name"), meta.get("path_or_table"), run_id)
+        if key not in out:
+            out[key] = r.payload.get("text", "")
+    return out
 
 
 # ------------------------------------------------------------------------------------
@@ -95,8 +159,8 @@ AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # optional bearer token
 PROJ_ROOT = os.getenv("PROJ_ROOT", ".")  # root for saving dw/rule/*.json
 
 # Ensure dw/rule directory exists
-DW_RULE_DIR = os.path.join(PROJ_ROOT, "dq", "rule")
-os.makedirs(DW_RULE_DIR, exist_ok=True)
+DQ_RULE_DIR = os.path.join(PROJ_ROOT, "dq", "rule")
+os.makedirs(DQ_RULE_DIR, exist_ok=True)
 
 # One client for all operations
 genai_client = genai.Client()  # auto picks GEMINI_API_KEY / GOOGLE_API_KEY
@@ -518,7 +582,7 @@ def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
                 active=False,
                 warnings=warnings,
                 created_at=created_at,
-                metadata={"source_type": "dw_rules"}
+                metadata={"source_type": "dq_rules"}
             )
             rules.append(rule)
         except Exception as e:
@@ -527,10 +591,10 @@ def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
 
 def save_rule_to_disk(rule: RuleModel) -> str:
     fname = sanitize_filename(rule.name or rule.id) + ".json"
-    fpath = os.path.join(DW_RULE_DIR, fname)
+    fpath = os.path.join(DQ_RULE_DIR, fname)
     payload = rule.dict()
     payload["metadata"] = {
-        "source_type": "dw_rules",
+        "source_type": "dq_rules",
         "path_or_table": rule.target.path_or_table,
         "source_name": rule.name
     }
@@ -553,7 +617,7 @@ def index_rule_in_qdrant(rule: RuleModel):
                 payload={
                     "text": text,
                     "metadata": {
-                        "source_type": "dw_rules",
+                        "source_type": "dq_rules",
                         "source_name": rule.name,
                         "path_or_table": rule.target.path_or_table,
                         "timestamp": time.time(),
@@ -593,14 +657,53 @@ def startup():
 def health():
     return {"status": "ok", "time": time.time()}
 
+
 @app.post("/upsert_batch")
 def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
     client = get_qdrant()
     points: List[PointStruct] = []
+
     for item in payload.items:
         md = item.metadata or Metadata()
         md.timestamp = md.timestamp or time.time()
+
+        # Try to enrich DQ run meta.json before chunking
+        summary_chunk = None
+        try:
+            obj = json.loads(item.text)
+            # Heuristic: treat any JSON that has 'run_id' & 'report_name' as a DQ run meta
+            if isinstance(obj, dict) and obj.get("run_id") and obj.get("report_name"):
+                run_id = obj.get("run_id")
+                report_name = obj.get("report_name")
+                rule_names = obj.get("rule_names") or []
+                overall_dq = obj.get("overall_dq")
+
+                # Enrich metadata
+                md.source_type = md.source_type or "dq_run_report"
+                md.source_name = md.source_name or f"{report_name} (Run {run_id})"
+                md.path_or_table = md.path_or_table  # keep whatever caller passed
+                md.extra = (md.extra or {})
+                md.extra.update({
+                    "run_id": run_id,
+                    "report_name": report_name,
+                    "rule_names": rule_names,
+                    "overall_dq": overall_dq,
+                })
+
+                # Prepend a human-friendly summary chunk
+                rules_preview = ", ".join(rule_names[:6]) if rule_names else ""
+                summary_chunk = (
+                    f"Report: {report_name} | Run: {run_id} | Overall DQ: {overall_dq}\n"
+                    f"Rules: {rules_preview}"
+                )
+        except Exception:
+            pass
+
+        # Chunking (prepend summary if present)
         chunks = chunk_text(item.text, payload.chunk_size, payload.chunk_overlap)
+        if summary_chunk:
+            chunks = [summary_chunk] + chunks
+
         vectors = embed_texts(chunks)
         for chunk, vec in zip(chunks, vectors):
             pid = item.id or str(uuid.uuid4())
@@ -614,11 +717,12 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
                     },
                 )
             )
+
     if not points:
         raise HTTPException(status_code=400, detail="No content to upsert")
+
     client.upsert(collection_name=QDRANT_COLLECTION, points=points)
     return {"upserted": len(points)}
-
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, _: None = Depends(check_auth)):
@@ -636,7 +740,7 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
     )
 
     # Filter & dedup
-    sources = _filter_rank_sources(results)
+    sources = _filter_rank_sources(results, intent="chat", query=req.query)
 
     # Build text index once (highest-scoring text per key)
     results_dict = _index_result_text(results)
@@ -649,10 +753,10 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
 
     context_block = "\n\n---\n\n".join(
         f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n"
-        + results_dict.get(
-            (s.get('source_type'), s.get('source_name'), s.get('path_or_table')),
+        + _summarize_payload_text ( results_dict.get(
+            (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id')),
             ""
-        )
+        ))
         for s in sources
     ) if sources else "No context."
 
@@ -813,7 +917,7 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
         query_filter=q_filter,
     )
 
-    sources = _filter_rank_sources(results)
+    sources = _filter_rank_sources(results, intent="analytics", query=req.query)
     results_dict = _index_result_text(results)
 
     system_prompt = (
