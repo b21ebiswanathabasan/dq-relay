@@ -1,5 +1,4 @@
-﻿
-# DQ Relay (FastAPI) unified on google-genai — UPDATED (11-Nov-2025)
+﻿# DQ Relay (FastAPI) unified on google-genai — UPDATED (11-Nov-2025)
 
 import os
 import time
@@ -30,6 +29,7 @@ from qdrant_client.http.models import (
 
 import re
 
+
 def ensure_payload_indexes(client: QdrantClient):
     """
     Create payload indexes for fields we use in filters.
@@ -39,7 +39,7 @@ def ensure_payload_indexes(client: QdrantClient):
         "metadata.source_type",
         "metadata.source_name",
         "metadata.path_or_table",
-        "metadata.extra.run_id",       # helpful for run-scoped queries
+        "metadata.extra.run_id",  # helpful for run-scoped queries
         # Optional (if you plan to filter by these later):
         # "metadata.extra.report_name",
         # "metadata.extra.rule_names",  # arrays are supported; treated as keyword list
@@ -58,8 +58,10 @@ def ensure_payload_indexes(client: QdrantClient):
                 continue
             print(f"[startup] payload index creation warning for {field}: {e}")
 
+
 def _soft_contains(hay: str, needle: str) -> bool:
     return needle.lower() in (hay or "").lower()
+
 
 def query_driven_filters(query: str) -> Dict[str, Any]:
     q = (query or "").lower()
@@ -79,26 +81,29 @@ def query_driven_filters(query: str) -> Dict[str, Any]:
 
     return filters
 
+
 def nudge_intent_for_analytics(query: str) -> bool:
     q = (query or "").lower()
     keys = ["top ", "failed rule", "failed rules", "trend", "distribution", "aggregate", "summary",
             "count of failures", "percent null", "grouped by"]
     return any(k in q for k in keys)
+
+
 # --- Relevance knobs ---
-MAX_SOURCES = int(os.getenv("MAX_SOURCES", "6"))      # cap how many sources we return/display
-MIN_SCORE   = float(os.getenv("MIN_SCORE", "0.35"))   # drop weak matches (tune 0.30–0.50)
+MAX_SOURCES = int(os.getenv("MAX_SOURCES", "6"))  # cap how many sources we return/display
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.35"))  # drop weak matches (tune 0.30–0.50)
 
 
 # --- Highest-score text per (type, name, path, run_id) ---
 def _index_result_text(results):
     out = {}
     for r in sorted(results, key=lambda x: x.score, reverse=True):
-        meta  = r.payload.get("metadata", {}) or {}
+        meta = r.payload.get("metadata", {}) or {}
         extra = meta.get("extra") or {}
         run_id = (extra or {}).get("run_id")
         key = (meta.get("source_type"), meta.get("source_name"), meta.get("path_or_table"), run_id)
         if key not in out:
-            out[key] = r.payload.get("text","") or ""
+            out[key] = r.payload.get("text", "") or ""
     return out
 
 
@@ -106,7 +111,7 @@ def _index_result_text(results):
 def _filter_rank_sources(results, *, intent: str = "", query: str = ""):
     uniq = {}
     for r in sorted(results, key=lambda x: x.score, reverse=True):
-        meta  = r.payload.get("metadata", {}) or {}
+        meta = r.payload.get("metadata", {}) or {}
         extra = meta.get("extra") or {}
         run_id = (extra or {}).get("run_id")
         key = (meta.get("source_type"), meta.get("source_name"), meta.get("path_or_table"), run_id)
@@ -172,6 +177,7 @@ genai_client = genai.Client()  # auto picks GEMINI_API_KEY / GOOGLE_API_KEY
 def get_qdrant() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
+
 def ensure_collection(client: QdrantClient, dim: int = 768):
     # If you move to gemini-embedding-001 (up to 3072 dims), change this
     collections = [c.name for c in client.get_collections().collections]
@@ -180,6 +186,7 @@ def ensure_collection(client: QdrantClient, dim: int = 768):
             collection_name=QDRANT_COLLECTION,
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
         )
+
 
 # ------------------------------------------------------------------------------------
 # Schemas
@@ -191,34 +198,41 @@ class Metadata(BaseModel):
     timestamp: Optional[float] = None
     extra: Optional[Dict[str, Any]] = None
 
+
 class UpsertItem(BaseModel):
     id: Optional[str] = None
     text: str
     metadata: Optional[Metadata] = None
+
 
 class UpsertBatchRequest(BaseModel):
     items: List[UpsertItem]
     chunk_size: int = 1200
     chunk_overlap: int = 150
 
+
 class ChatRequest(BaseModel):
     query: str
     top_k: int = 6
     filters: Optional[Dict[str, Any]] = None
-    max_output_tokens: int = 4096   # was 1024
+    max_output_tokens: int = 4096  # was 1024
     temperature: float = 0.2
+
 
 class ChatResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]]
+
 
 class RecommendationRequest(BaseModel):
     profile_summary: str = Field(..., description="Data profile summary text from Streamlit app")
     max_output_tokens: int = 4096
     temperature: float = 0.3
 
+
 class RecommendationResponse(BaseModel):
     recommendations: str
+
 
 class AnalyticsRequest(BaseModel):
     query: str = Field(..., description="Analytics question, e.g. 'Top 10 failed dq rules for last 3 months'")
@@ -227,16 +241,20 @@ class AnalyticsRequest(BaseModel):
     max_output_tokens: int = 4096
     temperature: float = 0.2
 
+
 class AnalyticsResponse(BaseModel):
     analysis: str
     sources: List[Dict[str, Any]]
 
+
 # NLP Rule Creation (same shape)
 ALLOWED_TYPES = ['not_null', 'regex', 'domain', 'range', 'unique', 'cross_field', 'freshness', 'referential']
+
 
 class SchemaColumn(BaseModel):
     name: str
     dtype: str
+
 
 class SchemaInput(BaseModel):
     dataset_alias: str
@@ -246,6 +264,7 @@ class SchemaInput(BaseModel):
     @property
     def column_names(self) -> List[str]:
         return [c.name for c in self.columns]
+
 
 class Predicate(BaseModel):
     type: str
@@ -258,10 +277,12 @@ class Predicate(BaseModel):
             raise ValueError(f"Unsupported condition.type '{v}'. Allowed: {ALLOWED_TYPES}")
         return v
 
+
 class RuleTarget(BaseModel):
     dataset_alias: str
     path_or_table: str
     column: Optional[str] = None
+
 
 class RuleModel(BaseModel):
     id: str
@@ -281,16 +302,19 @@ class RuleModel(BaseModel):
             raise ValueError("severity must be one of: info, warn, error")
         return v
 
+
 class NlpRuleCreateRequest(BaseModel):
     text: str
     schema: SchemaInput
     auto_commit: Optional[bool] = True
+
 
 # Smart routing
 class Intent(str, Enum):
     chat = "chat"
     analytics = "analytics"
     rule_create = "rule_create"
+
 
 class SmartRequest(BaseModel):
     query: str
@@ -300,6 +324,7 @@ class SmartRequest(BaseModel):
     temperature: float = 0.2
     max_output_tokens: int = 4096
 
+
 class SmartResponse(BaseModel):
     intent: Intent
     answer: Optional[str] = None
@@ -307,8 +332,10 @@ class SmartResponse(BaseModel):
     # rules omitted for now
     sources: List[Dict[str, Any]] = []
 
+
 class IntentChoice(BaseModel):
     intent: Intent
+
 
 # Models to match your UI
 class Operator(str, Enum):
@@ -322,6 +349,7 @@ class Operator(str, Enum):
     is_greater_than = "is greater than"
     is_greater_equal = "is greater than or equal to"
 
+
 class ConditionType(str, Enum):
     null_value = "null value"
     string_value = "string value"
@@ -331,6 +359,7 @@ class ConditionType(str, Enum):
     expression = "expression"
     function = "function"  # for is within / is not within
 
+
 class Statement(BaseModel):
     Column: str
     Operator: Operator
@@ -339,11 +368,13 @@ class Statement(BaseModel):
     # Optional hint to drive your popover type ("String" | "Float/Integer" | "Date/Time")
     DType: Optional[str] = Field(default=None)
 
+
 class InputColumn(BaseModel):
     name: str
     description: Optional[str] = None
     data_type: str = "String"  # "String" | "Integer" | "Float" | "Date/Time"
     max_length: Optional[str] = ""
+
 
 class RuleMapResponse(BaseModel):
     rule_name: Optional[str] = None
@@ -352,9 +383,11 @@ class RuleMapResponse(BaseModel):
     groups: List[List[Statement]]  # same shape as Streamlit Rule Builder
     dimension: Optional[str] = None
 
+
 class NlpRuleMapRequest(BaseModel):
     text: str
     schema: Dict[str, Any]  # Expected shape of your SchemaInput
+
 
 # ------------------------------------------------------------------------------------
 # Auth dependency
@@ -367,12 +400,14 @@ def check_auth(authorization: Optional[str] = Header(None)):
         if token != AUTH_TOKEN:
             raise HTTPException(status_code=403, detail="Forbidden")
 
+
 # ------------------------------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------------------------------
 def stable_id(text: str, metadata: Optional[Metadata]) -> str:
     base = (text or "") + "\n" + (metadata.source_type if metadata and metadata.source_type else "")
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     tokens = text.split()
@@ -386,6 +421,7 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
         i += max(1, chunk_size - overlap)
     return chunks
 
+
 def embed_texts(texts: List[str]) -> List[List[float]]:
     """Batch embeddings via google-genai."""
     if not texts:
@@ -394,10 +430,12 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     # result.embeddings is a list; each item has .values
     return [emb.values for emb in result.embeddings]
 
+
 def embed_query(text: str) -> List[float]:
     """Single query embedding via google-genai."""
     result = genai_client.models.embed_content(model=EMBED_MODEL, contents=[text])
     return result.embeddings[0].values
+
 
 def build_filter(filters: Optional[Dict[str, Any]]) -> Optional[Filter]:
     """
@@ -410,25 +448,29 @@ def build_filter(filters: Optional[Dict[str, Any]]) -> Optional[Filter]:
     conditions = []
     for k, v in filters.items():
         if k.startswith("extra."):
-            key = f"metadata.{k}"                  # filter under metadata.extra
+            key = f"metadata.{k}"  # filter under metadata.extra
         elif k in allowed_meta:
-            key = f"metadata.{k}"                  # top-level allowed keys
+            key = f"metadata.{k}"  # top-level allowed keys
         else:
-            continue                               # skip unknown keys (e.g., 'dimension', 'run_hint')
-        if isinstance(v, list):                    # support OR lists via 'should'
+            continue  # skip unknown keys (e.g., 'dimension', 'run_hint')
+        if isinstance(v, list):  # support OR lists via 'should'
             for item in v:
                 conditions.append(FieldCondition(key=key, match=MatchValue(value=item)))
         else:
             conditions.append(FieldCondition(key=key, match=MatchValue(value=v)))
     return Filter(should=conditions) if conditions else None
+
+
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
 
 def rule_to_text(rule: RuleModel) -> str:
     pt = rule.predicate.type
     expr = rule.predicate.expr or ""
     params = rule.predicate.params or {}
-    target = f"{rule.target.dataset_alias} {rule.target.path_or_table}" + (f" column {rule.target.column}" if rule.target.column else "")
+    target = f"{rule.target.dataset_alias} {rule.target.path_or_table}" + (
+        f" column {rule.target.column}" if rule.target.column else "")
     lines = [
         f"Rule: {rule.name}",
         f"Target: {target}",
@@ -440,11 +482,14 @@ def rule_to_text(rule: RuleModel) -> str:
     ]
     return "\n".join([l for l in lines if l])
 
+
 def gen_rule_id() -> str:
     return "rule_" + uuid.uuid4().hex[:12]
 
+
 def sanitize_filename(name: str) -> str:
     return "".join([c if c.isalnum() or c in ['_', '-', '.'] else '_' for c in (name or "")])[:80]
+
 
 # --- UPDATED: safer fence stripper ---
 def _strip_code_fences(text: str) -> str:
@@ -452,6 +497,7 @@ def _strip_code_fences(text: str) -> str:
     t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s*```$", "", t)
     return t.strip()
+
 
 # Operator synonyms
 _OP_SYNONYMS = {
@@ -467,14 +513,17 @@ _OP_SYNONYMS = {
     "<=": "is less than or equal to",
 }
 
+
 def _norm_op(txt: str) -> str:
     t = (txt or "").strip().lower()
     return _OP_SYNONYMS.get(t, t)
+
 
 def _is_iso_date(s: str) -> bool:
     # Lightweight date heuristic (yyyy-mm-dd or yyyy/mm/dd)
     s = (s or "").strip()
     return bool(re.fullmatch(r"\d{4}[-/]\d{2}[-/]\d{2}", s))
+
 
 def _infer_numeric_type(s: str) -> Optional[str]:
     val = (s or "").strip()
@@ -486,6 +535,7 @@ def _infer_numeric_type(s: str) -> Optional[str]:
         return "float value"
     return None
 
+
 def _infer_scalar_dtype_hint(s: str) -> str:
     """Return UI popover dtype hint: 'Float/Integer' | 'Date/Time' | 'String'."""
     if _infer_numeric_type(s):
@@ -494,16 +544,19 @@ def _infer_scalar_dtype_hint(s: str) -> str:
         return "Date/Time"
     return "String"
 
+
 def _infer_list_dtype_hint(values: List[str]) -> str:
     votes = {"String": 0, "Float/Integer": 0, "Date/Time": 0}
     for v in values or []:
         votes[_infer_scalar_dtype_hint(v)] += 1
     return max(votes, key=votes.get) if votes else "String"
 
+
 # --- UPDATED: simpler comma splitter ---
 def _split_list(raw: str) -> List[str]:
     s = (raw or "").strip().strip("{}")
     return [i.strip() for i in s.split(",") if i.strip()]
+
 
 # --- NEW: Condition type normalizer ---
 def _norm_condition_type(s: str) -> str:
@@ -516,6 +569,7 @@ def _norm_condition_type(s: str) -> str:
     if t in {"null", "none"}: t = "null value"
     return t
 
+
 def _to_ui_dtype(dtype_hint: str) -> str:
     """Map our hint to Input Columns choices: String | Integer | Float | Date/Time."""
     if dtype_hint == "Float/Integer":
@@ -524,6 +578,7 @@ def _to_ui_dtype(dtype_hint: str) -> str:
     if dtype_hint == "Date/Time":
         return "Date/Time"
     return "String"
+
 
 # ------------------------------------------------------------------------------------
 # NLP parsing — updated to new SDK (still plain JSON parsing for /nlp_rule_create)
@@ -602,6 +657,7 @@ def parse_rules_with_gemini(req: NlpRuleCreateRequest) -> List[RuleModel]:
             raise HTTPException(status_code=400, detail=f"Rule validation error: {e}")
     return rules
 
+
 def save_rule_to_disk(rule: RuleModel) -> str:
     fname = sanitize_filename(rule.name or rule.id) + ".json"
     fpath = os.path.join(DW_RULE_DIR, fname)
@@ -614,6 +670,7 @@ def save_rule_to_disk(rule: RuleModel) -> str:
     with open(fpath, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     return fpath
+
 
 def index_rule_in_qdrant(rule: RuleModel):
     client = get_qdrant()
@@ -645,8 +702,12 @@ def index_rule_in_qdrant(rule: RuleModel):
             )
         ]
     )
+
+
 # --- Rewrite summary.csv rows 'Rule N' => actual rule names using run meta ---
 import re
+
+
 def _rewrite_summary_csv(text: str, run_meta: Dict[str, Any]) -> str:
     t = (text or "").strip()
     if not t or "Rule" not in t.splitlines()[0]:
@@ -658,7 +719,8 @@ def _rewrite_summary_csv(text: str, run_meta: Dict[str, Any]) -> str:
     out_lines = []
     for i, line in enumerate(lines):
         if i == 0:
-            out_lines.append(line); continue
+            out_lines.append(line);
+            continue
         parts = [p.strip() for p in line.split(",")]
         if not parts: out_lines.append(line); continue
         first = parts[0]
@@ -667,17 +729,20 @@ def _rewrite_summary_csv(text: str, run_meta: Dict[str, Any]) -> str:
             idx = int(m.group(1)) - 1
             if 0 <= idx < len(rule_names):
                 parts[0] = rule_names[idx]
-            out_lines.append(",".join(parts)); continue
+            out_lines.append(",".join(parts));
+            continue
         out_lines.append(line)
     return "\n".join(out_lines)
+
+
 # --- Source gating: prefer DQ; exclude profile* unless asked; drop run_results_* ---
 def _should_include(meta: Dict[str, Any], *, intent: str, query: str) -> bool:
     st = (meta.get("source_type") or "").lower()
     sn = (meta.get("source_name") or "").lower()
     pt = (meta.get("path_or_table") or "").lower()
-    q  = (query or "").lower()
+    q = (query or "").lower()
 
-    wants_profile = any(w in q for w in ["profile","cleansing","recommendation","cleanse"])
+    wants_profile = any(w in q for w in ["profile", "cleansing", "recommendation", "cleanse"])
 
     def has(term: str) -> bool:
         t = term.lower()
@@ -685,12 +750,13 @@ def _should_include(meta: Dict[str, Any], *, intent: str, query: str) -> bool:
 
     if intent == "analytics":
         if wants_profile:
-            return has("profile_report") or has("profile_summary") or has("profile_recommendation") or has("profile-recommendation")
+            return has("profile_report") or has("profile_summary") or has("profile_recommendation") or has(
+                "profile-recommendation")
         if has("profile_recommendation") or has("profile-recommendation"):
             return False
         if sn.startswith("run_results_") or "run_results_" in pt:
             return False
-        return (st in {"dq_run_report","dq_rules"}) or has("meta.json") or has("report.json")
+        return (st in {"dq_run_report", "dq_rules"}) or has("meta.json") or has("report.json")
 
     if intent == "chat":
         if not wants_profile and (has("profile_recommendation") or has("profile-recommendation")):
@@ -701,6 +767,8 @@ def _should_include(meta: Dict[str, Any], *, intent: str, query: str) -> bool:
         return True
 
     return True
+
+
 # ------------------------------------------------------------------------------------
 # FastAPI app & endpoints
 # ------------------------------------------------------------------------------------
@@ -715,6 +783,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.on_event("startup")
 def startup():
     client = get_qdrant()
@@ -722,10 +791,10 @@ def startup():
     ensure_collection(client, dim=768)
     ensure_payload_indexes(client)
 
+
 @app.get("/health")
 def health():
     return {"status": "ok", "time": time.time()}
-
 
 
 @app.post("/upsert_batch")
@@ -765,22 +834,34 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
         # Enrich DQ run meta (JSON or KV) so analytics can use contributions/dimensions
         summary_chunk = None
         if isinstance(obj, dict) and obj.get("run_id") and obj.get("report_name"):
-            run_id      = obj.get("run_id")
+            run_id = obj.get("run_id")
             report_name = obj.get("report_name")
-            rule_names  = obj.get("rule_names") or []
-            overall_dq  = obj.get("overall_dq")
+            rule_names = obj.get("rule_names") or []
+            overall_dq = obj.get("overall_dq")
             md.source_type = md.source_type or "dq_run_report"
             md.source_name = md.source_name or f"{report_name} (Run {run_id})"
-            md.extra       = (md.extra or {})
+            md.extra = (md.extra or {})
             md.extra.update({
                 "run_id": run_id,
                 "report_name": report_name,
                 "rule_names": rule_names,
                 "overall_dq": overall_dq,
-                "rule_scores":          obj.get("rule_scores"),
+                "rule_scores": obj.get("rule_scores"),
                 "rule_overall_contrib": obj.get("rule_overall_contrib"),
                 "dimension_counts_map": obj.get("dimension_counts_map"),
             })
+
+            # ➊ NEW: add a JSON meta chunk to 'text' so _collect_run_meta sees it
+            meta_json_chunk = json.dumps({
+                "run_id": run_id,
+                "report_name": report_name,
+                "rule_names": rule_names,
+                "overall_dq": overall_dq,
+                "rule_scores": obj.get("rule_scores"),
+                "rule_overall_contrib": obj.get("rule_overall_contrib"),
+                "dimension_counts_map": obj.get("dimension_counts_map"),
+            }, ensure_ascii=False)
+
             preview_names = ", ".join(rule_names[:6]) if rule_names else ""
             summary_chunk = (
                 f"Report: {report_name}\n"
@@ -789,8 +870,10 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
                 f"Rules: {preview_names}"
             )
 
-        # Chunking with optional summary
+        # Chunking with optional summary + meta JSON
         chunks = []
+        if meta_json_chunk:
+            chunks.append(meta_json_chunk)  # ➋ NEW: JSON meta goes first (starts with '{')
         if summary_chunk:
             chunks.append(summary_chunk)
         tokens = item.text.split()
@@ -818,13 +901,27 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
 
     client.upsert(collection_name=QDRANT_COLLECTION, points=points)
     return {"upserted": len(points)}
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, _: None = Depends(check_auth)):
-    client   = get_qdrant()
-    qvec     = embed_query(req.query)
+    
+    if nudge_intent_for_analytics(req.query):
+        # call analytics directly to ensure top-N logic & recall
+        aresp = analytics(AnalyticsRequest(
+            query=req.query,
+            top_k=max(20, req.top_k),
+            filters=req.filters,
+            max_output_tokens=req.max_output_tokens,
+            temperature=req.temperature
+        ))
+        return ChatResponse(answer=aresp.analysis, sources=aresp.sources)
+
+    client = get_qdrant()
+    qvec = embed_query(req.query)
     # Merge UI filters with query-driven filters
-    qf       = query_driven_filters(req.query)
-    merged   = dict(req.filters or {})
+    qf = query_driven_filters(req.query)
+    merged = dict(req.filters or {})
     # Only merge if the query-driven filter explicitly sets source_type
     if qf.get("source_type"):
         merged["source_type"] = qf["source_type"]
@@ -854,12 +951,12 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
     sources = _filter_rank_sources(results, intent="chat", query=req.query)
 
     run_meta_by_id = _collect_run_meta(results)
-    results_dict   = _index_result_text(results)
+    results_dict = _index_result_text(results)
 
     def _ctx(s):
         key = (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id'))
         raw = results_dict.get(key, "")
-        pt  = (s.get('path_or_table') or "").lower()
+        pt = (s.get('path_or_table') or "").lower()
         if pt.endswith("summary.csv"):
             rid = s.get("run_id")
             if rid and rid in run_meta_by_id:
@@ -872,7 +969,7 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
     )
 
     context_block = "\n\n---\n\n".join(
-        f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n" + _ctx(s)
+        f"[{s.get('source_type', 'doc')}] {s.get('source_name', '')} {s.get('path_or_table', '')}\n" + _ctx(s)
         for s in sources
     ) if sources else "No context."
 
@@ -882,7 +979,7 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
     )
 
     resp = genai_client.models.generate_content(
-        model=os.getenv("GEN_MODEL","gemini-2.5-flash"),
+        model=os.getenv("GEN_MODEL", "gemini-2.5-flash"),
         contents=user_prompt,
         config=types.GenerateContentConfig(max_output_tokens=req.max_output_tokens, temperature=req.temperature)
     )
@@ -898,6 +995,8 @@ def chat(req: ChatRequest, _: None = Depends(check_auth)):
             "Please load your DQ reports or rules via /upsert_batch."
         )
     return ChatResponse(answer=answer, sources=sources)
+
+
 @app.post("/recommend", response_model=RecommendationResponse)
 def recommend(req: RecommendationRequest, _: None = Depends(check_auth)):
     # Detect mode tag in the incoming summary
@@ -977,6 +1076,7 @@ def _strong_json_rules_prompt(profile_summary: str) -> str:
         f"{profile_summary}\n"
     )
 
+
 def _strong_json_cleanse_prompt(profile_summary: str) -> str:
     example = (
         "{\n"
@@ -993,6 +1093,7 @@ def _strong_json_cleanse_prompt(profile_summary: str) -> str:
         "Dataset Profile Summary:\n"
         f"{profile_summary}\n"
     )
+
 
 def _gen_strict_json(client, model: str, prompt: str, max_tokens: int, temperature: float) -> str:
     # Prefer structured JSON text; keep SDK simple & robust
@@ -1013,6 +1114,7 @@ def _gen_strict_json(client, model: str, prompt: str, max_tokens: int, temperatu
 
 
 # --- Collect run meta (same shape as before; ensure callable) ---
+
 def _collect_run_meta(results):
     out = {}
     for r in results:
@@ -1020,6 +1122,8 @@ def _collect_run_meta(results):
         st   = (meta.get("source_type") or "").lower()
         if st != "dq_run_report":
             continue
+
+        # ➊ Try JSON in text first (unchanged)
         text = r.payload.get("text","") or ""
         if text.strip().startswith("{"):
             try:
@@ -1032,17 +1136,31 @@ def _collect_run_meta(results):
                         "dimension_counts_map": obj.get("dimension_counts_map"),
                         "rule_overall_contrib": obj.get("rule_overall_contrib"),
                     }
+                    continue
             except Exception:
                 pass
+
+        # ➋ NEW fallback: use metadata.extra if present
+        extra = meta.get("extra") or {}
+        rid   = extra.get("run_id")
+        if rid:
+            out[rid] = {
+                "rule_names": extra.get("rule_names") or [],
+                "rule_scores": extra.get("rule_scores") or [],
+                "overall_dq": extra.get("overall_dq"),
+                "dimension_counts_map": extra.get("dimension_counts_map"),
+                "rule_overall_contrib": extra.get("rule_overall_contrib"),
+            }
     return out
+
 
 @app.post("/analytics", response_model=AnalyticsResponse)
 def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
-    client   = get_qdrant()
-    qvec     = embed_query(req.query)
+    client = get_qdrant()
+    qvec = embed_query(req.query)
     # Merge UI filters with query-driven filters
-    qf       = query_driven_filters(req.query)
-    merged   = dict(req.filters or {})
+    qf = query_driven_filters(req.query)
+    merged = dict(req.filters or {})
     if qf.get("source_type"):
         merged["source_type"] = qf["source_type"]
     q_filter = build_filter(merged)
@@ -1068,12 +1186,12 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     sources = _filter_rank_sources(results, intent="analytics", query=req.query)
 
     run_meta_by_id = _collect_run_meta(results)
-    results_dict   = _index_result_text(results)
+    results_dict = _index_result_text(results)
 
     def _ctx(s):
         key = (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id'))
         raw = results_dict.get(key, "")
-        pt  = (s.get('path_or_table') or "").lower()
+        pt = (s.get('path_or_table') or "").lower()
         if pt.endswith("summary.csv"):
             rid = s.get("run_id")
             if rid and rid in run_meta_by_id:
@@ -1086,14 +1204,14 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     )
 
     context_block = "\n\n---\n\n".join(
-        f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n" + _ctx(s)
+        f"[{s.get('source_type', 'doc')}] {s.get('source_name', '')} {s.get('path_or_table', '')}\n" + _ctx(s)
         for s in sources
     ) if sources else "No context."
 
     user_prompt = f"{system_prompt}\n\nContext:\n{context_block}\n\nQuestion:\n{req.query}\n"
 
     resp = genai_client.models.generate_content(
-        model=os.getenv("GEN_MODEL","gemini-2.5-flash"),
+        model=os.getenv("GEN_MODEL", "gemini-2.5-flash"),
         contents=user_prompt,
         config=types.GenerateContentConfig(max_output_tokens=req.max_output_tokens, temperature=req.temperature)
     )
@@ -1109,6 +1227,8 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     if not analysis:
         analysis = "No analytics could be generated from the current context."
     return AnalyticsResponse(analysis=analysis, sources=sources)
+
+
 @app.post("/nlp_rule_create", response_model=List[RuleModel])
 def nlp_rule_create(req: NlpRuleCreateRequest, _: None = Depends(check_auth)):
     rules = parse_rules_with_gemini(req)
@@ -1122,6 +1242,7 @@ def nlp_rule_create(req: NlpRuleCreateRequest, _: None = Depends(check_auth)):
             w.append(f"Indexing failed: {e}")
             rules[i].warnings = w
     return rules
+
 
 # ------------------------------------------------------------------------------------
 # Smart endpoint: Structured Outputs intent + delegation
@@ -1143,8 +1264,8 @@ def _classify_intent_structured(query: str) -> Intent:
         q = (query or "").lower()
         if ("create rule" in q) or ("define rule" in q):
             return Intent.rule_create
-        rule_words = ["not null","regex","matches","unique","referential","exists in",
-                      "freshness","within","between","domain","range",">=","<=",
+        rule_words = ["not null", "regex", "matches", "unique", "referential", "exists in",
+                      "freshness", "within", "between", "domain", "range", ">=", "<=",
                       ">", "<", "=", "!=", "satisfies"]
         if any(w in q for w in rule_words):
             return Intent.rule_create
@@ -1154,7 +1275,6 @@ def _classify_intent_structured(query: str) -> Intent:
         if any(w in q for w in analytics_words) or q.startswith("top "):
             return Intent.analytics
         return Intent.chat
-
 
 
 @app.post("/smart", response_model=SmartResponse)
@@ -1179,6 +1299,8 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
         return SmartResponse(intent=intent, analysis=resp.analysis, sources=resp.sources)
 
     return SmartResponse(intent=intent, answer="Intent 'rule_create' is disabled in this client.", sources=[])
+
+
 # --- Helpers for robust fallback -------------------------------------------------
 
 def _split_items_natural(raw: str) -> List[str]:
@@ -1195,6 +1317,7 @@ def _split_items_natural(raw: str) -> List[str]:
     # Final split on comma
     items = [i.strip() for i in s.split(",") if i.strip()]
     return items
+
 
 def _heuristic_rulemap_from_text(text: str, schema_cols: List[Dict[str, Any]]) -> Optional[RuleMapResponse]:
     """
@@ -1228,14 +1351,16 @@ def _heuristic_rulemap_from_text(text: str, schema_cols: List[Dict[str, Any]]) -
             statements.append(Statement(
                 Column=col,
                 Operator=Operator.is_greater_equal,
-                Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+", a) else ConditionType.float_value,
+                Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+",
+                                                                           a) else ConditionType.float_value,
                 Condition_Value=a,
                 DType="Float/Integer"
             ))
             statements.append(Statement(
                 Column=col,
                 Operator=Operator.is_less_equal,
-                Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+", b) else ConditionType.float_value,
+                Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+-]?\d+",
+                                                                           b) else ConditionType.float_value,
                 Condition_Value=b,
                 DType="Float/Integer"
             ))
@@ -1274,7 +1399,8 @@ def _heuristic_rulemap_from_text(text: str, schema_cols: List[Dict[str, Any]]) -
             uniq_hits.add(sc)
     # If no schema was provided, try to guess a token before 'column'
     if not uniq_hits and not cols_set:
-        m_guess = re.search(r"['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\s+column\b[^.\n]*\b(unique|no\s+duplicates|distinct)\b", lower)
+        m_guess = re.search(
+            r"['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\s+column\b[^.\n]*\b(unique|no\s+duplicates|distinct)\b", lower)
         if m_guess:
             uniq_hits.add(m_guess.group(1))
 
@@ -1317,7 +1443,7 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
         schema_dict: Dict[str, Any] = req.schema or {}
         columns_in_schema: List[Dict[str, Any]] = schema_dict.get("columns", []) or []
         schema_cols_str = ", ".join(
-            [f"{c.get('name')}: {c.get('dtype','')}" for c in columns_in_schema if c.get("name")]
+            [f"{c.get('name')}: {c.get('dtype', '')}" for c in columns_in_schema if c.get("name")]
         )
 
         # --- Tiny helpers local to this function ---
@@ -1345,14 +1471,16 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                         Statement(
                             Column=col,
                             Operator=Operator.is_greater_equal,
-                            Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+", a) else ConditionType.float_value,
+                            Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+",
+                                                                                       a) else ConditionType.float_value,
                             Condition_Value=a,
                             DType="Float/Integer"
                         ),
                         Statement(
                             Column=col,
                             Operator=Operator.is_less_equal,
-                            Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+", b) else ConditionType.float_value,
+                            Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+",
+                                                                                       b) else ConditionType.float_value,
                             Condition_Value=b,
                             DType="Float/Integer"
                         ),
@@ -1405,14 +1533,16 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                     statements.append(Statement(
                         Column=col,
                         Operator=Operator.is_greater_than,
-                        Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+", a) else ConditionType.float_value,
+                        Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+",
+                                                                                   a) else ConditionType.float_value,
                         Condition_Value=a,
                         DType="Float/Integer"
                     ))
                     statements.append(Statement(
                         Column=col,
                         Operator=Operator.is_less_than,
-                        Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+", b) else ConditionType.float_value,
+                        Condition_Type=ConditionType.integer_value if re.fullmatch(r"[+\-]?\d+",
+                                                                                   b) else ConditionType.float_value,
                         Condition_Value=b,
                         DType="Float/Integer"
                     ))
@@ -1433,7 +1563,8 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                         Condition_Value=f"Trim({col_ne}) <> ''",
                         DType="String"
                     ))
-                    inputs_map[col_ne] = inputs_map.get(col_ne) or InputColumn(name=col_ne, data_type="String", description="", max_length="")
+                    inputs_map[col_ne] = inputs_map.get(col_ne) or InputColumn(name=col_ne, data_type="String",
+                                                                               description="", max_length="")
 
             # --- NEW: (6) not null -> 'is not' + 'null value' ---
             m_not_null = re.search(
@@ -1450,7 +1581,8 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                         Condition_Value="",
                         DType="String"
                     ))
-                    inputs_map[col_nn] = inputs_map.get(col_nn) or InputColumn(name=col_nn, data_type="String", description="", max_length="")
+                    inputs_map[col_nn] = inputs_map.get(col_nn) or InputColumn(name=col_nn, data_type="String",
+                                                                               description="", max_length="")
 
             if statements:
                 return RuleMapResponse(
@@ -1568,16 +1700,26 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
             norm_group: List[Statement] = []
             for stt in group:
                 op_norm = _norm_op(stt.Operator.value if isinstance(stt.Operator, Operator) else str(stt.Operator))
-                if op_norm == "is": op_enum = Operator.is_
-                elif op_norm == "is not": op_enum = Operator.is_not
-                elif op_norm == "is within": op_enum = Operator.is_within
-                elif op_norm == "is not within": op_enum = Operator.is_not_within
-                elif op_norm == "is less than": op_enum = Operator.is_less_than
-                elif op_norm == "is less than or equal to": op_enum = Operator.is_less_equal
-                elif op_norm == "is greater than": op_enum = Operator.is_greater_than
-                elif op_norm == "is greater than or equal to": op_enum = Operator.is_greater_equal
-                elif op_norm == "contains": op_enum = Operator.contains
-                else: op_enum = Operator.is_
+                if op_norm == "is":
+                    op_enum = Operator.is_
+                elif op_norm == "is not":
+                    op_enum = Operator.is_not
+                elif op_norm == "is within":
+                    op_enum = Operator.is_within
+                elif op_norm == "is not within":
+                    op_enum = Operator.is_not_within
+                elif op_norm == "is less than":
+                    op_enum = Operator.is_less_than
+                elif op_norm == "is less than or equal to":
+                    op_enum = Operator.is_less_equal
+                elif op_norm == "is greater than":
+                    op_enum = Operator.is_greater_than
+                elif op_norm == "is greater than or equal to":
+                    op_enum = Operator.is_greater_equal
+                elif op_norm == "contains":
+                    op_enum = Operator.contains
+                else:
+                    op_enum = Operator.is_
 
                 col_name = (stt.Column or "").strip()
                 cond_val = (stt.Condition_Value or "").strip()
@@ -1680,7 +1822,8 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                             DType="String"
                         )
                         continue
-                    if s.Operator in (Operator.is_, Operator.is_not) and s.Condition_Type in (ConditionType.string_value, ConditionType.expression):
+                    if s.Operator in (Operator.is_, Operator.is_not) and s.Condition_Type in (
+                            ConditionType.string_value, ConditionType.expression):
                         cv = (s.Condition_Value or "").strip()
                         if cv and cv.lower() not in ("null", "none", "current timestamp", "now", "today"):
                             normalized_groups[g_idx][s_idx] = Statement(
@@ -1732,13 +1875,14 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
         try:
             class DimChoice(BaseModel):
                 dimension: str  # one of ['Completeness','Uniqueness','Consistency','Accuracy','Timeliness','Integrity']
+
             dim_prompt = (
-                "Given the following rule statements, classify the primary Data Quality dimension "
-                "as one of: Completeness, Uniqueness, Consistency, Accuracy, Timeliness, Integrity.\n\n"
-                "Statements:\n" +
-                "\n".join([f"- {s.Column} {s.Operator} {s.Condition_Type} {s.Condition_Value or ''}"
-                           for g in normalized_groups for s in g]) +
-                "\n\nReturn ONLY JSON with field 'dimension'."
+                    "Given the following rule statements, classify the primary Data Quality dimension "
+                    "as one of: Completeness, Uniqueness, Consistency, Accuracy, Timeliness, Integrity.\n\n"
+                    "Statements:\n" +
+                    "\n".join([f"- {s.Column} {s.Operator} {s.Condition_Type} {s.Condition_Value or ''}"
+                               for g in normalized_groups for s in g]) +
+                    "\n\nReturn ONLY JSON with field 'dimension'."
             )
             dim_resp = genai_client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -1763,11 +1907,13 @@ def nlp_rule_map(req: NlpRuleMapRequest, _: None = Depends(check_auth)):
                 predicted_dim = "Uniqueness"
             elif any(k in txt_all for k in ["format", "regex", "pattern", "length", "datatype", "type check", "valid"]):
                 predicted_dim = "Consistency"
-            elif any(k in txt_all for k in [">=", "<=", ">", "<", "between", "range", "within", "threshold", "accuracy"]):
+            elif any(k in txt_all for k in
+                     [">=", "<=", ">", "<", "between", "range", "within", "threshold", "accuracy"]):
                 predicted_dim = "Accuracy"
             elif any(k in txt_all for k in ["timestamp", "time", "date", "recent", "late", "timeliness"]):
                 predicted_dim = "Timeliness"
-            elif any(k in txt_all for k in ["reference", "referential", "foreign key", "fk", "parent", "child", "integrity"]):
+            elif any(k in txt_all for k in
+                     ["reference", "referential", "foreign key", "fk", "parent", "child", "integrity"]):
                 predicted_dim = "Integrity"
             else:
                 predicted_dim = "Consistency"
