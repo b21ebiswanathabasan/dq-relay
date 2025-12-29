@@ -76,11 +76,20 @@ def query_driven_filters(query: str) -> Dict[str, Any]:
     q = (query or "").lower()
     filters: Dict[str, Any] = {}
 
+    if re.search(r"\bshow\s+me\b.*\brules\b.*\b(table|tabular)\b", q) and ("run" not in q and "execution" not in q):
+        filters["source_type"] = ["dq_rules"]
+
     # Catalog: "how many/available/existing dq rules"
     if re.search(r"\b(how\s+many|available|existing)\b.*\bdq\s+rules\b", q):
         filters["source_type"] = ["dq_rules"]
 
-    # Profile-applied rules: support "rules applied" and "applied dq rules"
+    if re.search(r"\b(how\s+many|available|existing|existin)\b.*\bdq\s+rules\b", q):
+        filters["source_type"] = ["dq_rules"]
+
+    if re.search(r"\b(valid\s+vs\s+invalid|valid\s+and\s+invalid)\b.*\brecord\s+count\b", q):
+        filters["source_type"] = ["dq_run_report"]
+
+            # Profile-applied rules: support "rules applied" and "applied dq rules"
     if re.search(r"\b(rules\s+applied|applied\s+dq\s+rules)\b.*\b(profile|data\s+profile)\b", q):
         filters["source_type"] = ["profile_summary"]
         # Optional: capture profile name (e.g., "... for 10K_Customer")
@@ -848,6 +857,9 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
             report_name = obj.get("report_name")
             rule_names = obj.get("rule_names") or []
             overall_dq = obj.get("overall_dq")
+            overall_valid = obj.get("overall_valid_count")  # ADDED
+            overall_invalid = obj.get("overall_invalid_count")  # ADDED
+            total_count = obj.get("total_count")  # ADDED
 
             md.source_type = md.source_type or "dq_run_report"
             md.source_name = md.source_name or f"{report_name} (Run {run_id})"
@@ -860,6 +872,9 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
                 "rule_scores": obj.get("rule_scores"),
                 "rule_overall_contrib": obj.get("rule_overall_contrib"),
                 "dimension_counts_map": obj.get("dimension_counts_map"),
+                "overall_valid_count": overall_valid,  # ADDED
+                "overall_invalid_count": overall_invalid,  # ADDED
+                "total_count": total_count,  # ADDED
             })
 
             # NEW: add a JSON meta chunk to 'text' so _collect_run_meta can read it
@@ -871,6 +886,9 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
                 "rule_scores": obj.get("rule_scores"),
                 "rule_overall_contrib": obj.get("rule_overall_contrib"),
                 "dimension_counts_map": obj.get("dimension_counts_map"),
+                "overall_valid_count": overall_valid,  # ADDED
+                "overall_invalid_count": overall_invalid,  # ADDED
+                "total_count": total_count,  # ADDED
             }, ensure_ascii=False)
 
             # Keep your preview chunk
@@ -1165,21 +1183,24 @@ def _collect_run_meta(results):
     return out
 
 
+
 @app.post("/analytics", response_model=AnalyticsResponse)
 def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     client = get_qdrant()
-    qvec = embed_query(req.query)
-    # Merge UI filters with query-driven filters
-    qf = query_driven_filters(req.query)
+    qvec   = embed_query(req.query)
+
+    # Merge UI filters with query-driven filters (unchanged)
+    qf     = query_driven_filters(req.query)
     merged = dict(req.filters or {})
     if qf.get("source_type"):
         merged["source_type"] = qf["source_type"]
     q_filter = build_filter(merged)
 
+    # CHANGED: raise internal recall to include multiple runs per report
     results = client.search(
         collection_name=QDRANT_COLLECTION,
         query_vector=("default", qvec),
-        limit=max(20, req.top_k),  # minimal recall; cap sources separately
+        limit=max(20, req.top_k),  # CHANGED: internal recall ↑; final sources are still capped by MAX_SOURCES
         with_payload=True,
         score_threshold=MIN_SCORE,
         query_filter=q_filter,
@@ -1188,39 +1209,207 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
         results = client.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=("default", qvec),
-            limit=max(20, req.top_k),
+            limit=max(20, req.top_k),  # CHANGED: keep same higher recall on fallback
             with_payload=True,
             score_threshold=max(0.20, MIN_SCORE * 0.8),
             query_filter=None,
         )
 
-    sources = _filter_rank_sources(results, intent="analytics", query=req.query)
+    # Prefer DQ run reports & rules in analytics (unchanged gating)
+    sources         = _filter_rank_sources(results, intent="analytics", query=req.query)
+    run_meta_by_id  = _collect_run_meta(results)        # unchanged
+    results_dict    = _index_result_text(results)       # unchanged
 
-    run_meta_by_id = _collect_run_meta(results)
-    results_dict = _index_result_text(results)
-
+    # Unchanged: context text per source, with summary.csv rewrite
     def _ctx(s):
         key = (s.get('source_type'), s.get('source_name'), s.get('path_or_table'), s.get('run_id'))
         raw = results_dict.get(key, "")
-        pt = (s.get('path_or_table') or "").lower()
+        pt  = (s.get('path_or_table') or "").lower()
         if pt.endswith("summary.csv"):
             rid = s.get("run_id")
             if rid and rid in run_meta_by_id:
                 return _rewrite_summary_csv(raw, run_meta_by_id[rid])
         return raw
 
+    # -------------------------------------------------------------------------
+    # ADDED: Aggregate "valid vs invalid record count" by LAST RUN and AVERAGE
+    #        across ALL runs per report_name, using totals from run meta.
+    #        (Relies on `overall_valid_count`, `overall_invalid_count`, `total_count`
+    #         in the text JSON or metadata.extra of dq_run_report items.)  [1](https://kpmgindia365-my.sharepoint.com/personal/sourabkundu_kpmg_com/Documents/Microsoft%20Copilot%20Chat%20Files/meta.json)
+    # -------------------------------------------------------------------------
+    runs = []
+    for r in results:
+        meta  = r.payload.get("metadata", {}) or {}
+        st    = (meta.get("source_type") or "").lower()
+        if st != "dq_run_report":
+            continue
+        extra = meta.get("extra") or {}
+        report_name = extra.get("report_name")
+        run_id      = extra.get("run_id")
+        valid       = extra.get("overall_valid_count")
+        invalid     = extra.get("overall_invalid_count")
+        total       = extra.get("total_count")
+
+        # ADDED: derive a comparable creation key to select "last run"
+        created_ts  = extra.get("created_at")
+        if not created_ts and isinstance(run_id, str) and "_" in run_id:
+            created_ts = run_id  # fallback: lexicographic compare on 'YYYYMMDD_HHMMSS'
+
+        # ADDED: accept only runs that carry all three totals
+        if report_name and run_id and (valid is not None) and (invalid is not None) and (total is not None):
+            runs.append((report_name, run_id, str(created_ts or ""), int(valid), int(invalid), int(total)))
+
+    # ADDED: group by report_name
+    from collections import defaultdict
+    by_report = defaultdict(list)
+    for row in runs:
+        by_report[row[0]].append(row)
+
+    # ADDED: compute last-run totals and simple averages across runs
+    summary_rows = []
+    for report_name, items in by_report.items():
+        items_sorted = sorted(items, key=lambda x: x[2], reverse=True)  # sort by created_ts
+        last = items_sorted[0]
+        last_valid, last_invalid, last_total = last[3], last[4], last[5]
+        avg_valid   = round(sum(x[3] for x in items) / len(items), 2)
+        avg_invalid = round(sum(x[4] for x in items) / len(items), 2)
+        avg_total   = round(sum(x[5] for x in items) / len(items), 2)
+
+        summary_rows.append({
+            "report":       report_name,
+            "last_run_id":  last[1],
+            "last_valid":   last_valid,
+            "last_invalid": last_invalid,
+            "last_total":   last_total,
+            "avg_valid":    avg_valid,
+            "avg_invalid":  avg_invalid,
+            "avg_total":    avg_total,
+        })
+    from collections import Counter
+
+    rule_fail_counter = Counter()
+    # Walk all dq_run_report results and sum invalid_count per rule
+    for r in results:
+        meta = r.payload.get("metadata", {}) or {}
+        if (meta.get("source_type") or "").lower() != "dq_run_report":
+            continue
+        txt = r.payload.get("text", "") or ""
+        # if JSON meta chunk present in text, parse it
+        if txt.strip().startswith("{"):
+            try:
+                obj = json.loads(txt)
+                for rs in (obj.get("rule_scores") or []):
+                    # your meta uses a flat list OR KV; we handle both
+                    if isinstance(rs, dict):
+                        name = rs.get("rule_name")
+                        inv = rs.get("invalid_count")
+                        if name and isinstance(inv, (int, float)):
+                            rule_fail_counter[name] += int(inv)
+            except Exception:
+                pass
+        else:
+            # fallback to metadata.extra.rule_scores (list of dicts), if available
+            extra = meta.get("extra") or {}
+            for rs in (extra.get("rule_scores") or []):
+                if isinstance(rs, dict):
+                    name = rs.get("rule_name")
+                    inv = rs.get("invalid_count")
+                    if name and isinstance(inv, (int, float)):
+                        rule_fail_counter[name] += int(inv)
+    # pick Top-5
+    top5 = rule_fail_counter.most_common(5)
+
+    def _top5_table(pairs):
+        if not pairs: return "No failed-rule counts found in context."
+        hdr = "| Rank | Rule Name | Total Invalid Count |\n|---:|---|---:|"
+        lines = [hdr] + [f"| {i + 1} | {name} | {count} |" for i, (name, count) in enumerate(pairs)]
+        return "\n".join(lines)
+
+    top5_block = _top5_table(top5)
+    # ADDED: render a compact Markdown table if the user asks for valid/invalid totals
+    def _build_valid_invalid_table(rows: list) -> str:
+        if not rows:
+            return "No run totals found in context."
+        hdr = "| Report | Last Run ID | Last Valid | Last Invalid | Last Total | Avg Valid | Avg Invalid | Avg Total |\n" \
+              "|---|---|---:|---:|---:|---:|---:|---:|"
+        lines = [hdr]
+        for r in rows:
+            lines.append(
+                f"| {r['report']} | {r['last_run_id']} | {r['last_valid']} | {r['last_invalid']} | {r['last_total']} | "
+                f"{r['avg_valid']} | {r['avg_invalid']} | {r['avg_total']} |"
+            )
+        return "\n".join(lines)
+
+    # Unchanged: build the LLM context block (source snippets)
     system_prompt = (
         "You are a Data Quality analytics assistant. Use only the provided context. "
         "Return a short, complete summary. Focus on aggregations, trends, and top‑N answers."
     )
-
     context_block = "\n\n---\n\n".join(
-        f"[{s.get('source_type', 'doc')}] {s.get('source_name', '')} {s.get('path_or_table', '')}\n" + _ctx(s)
+        f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n" + _ctx(s)
         for s in sources
     ) if sources else "No context."
 
-    user_prompt = f"{system_prompt}\n\nContext:\n{context_block}\n\nQuestion:\n{req.query}\n"
+    # CHANGED: if the query is about valid vs invalid totals, prepend the table
 
+    # ADDED: If the query asks for dq_rules in "tabular format", fetch ALL dq_rules via scroll and render a table
+    q_lower = (req.query or "").lower()
+    wants_rules_table = (
+            ("dq rules" in q_lower) and ("table" in q_lower or "tabular" in q_lower)
+    )
+
+    rules_rows = []
+    if wants_rules_table and (merged.get("source_type") == ["dq_rules"]):
+        # Scroll all dq_rules
+        flt = Filter(should=[FieldCondition(key="metadata.source_type", match=MatchValue(value="dq_rules"))])
+        next_page = None
+        while True:
+            page, next_page = client.scroll(
+                collection_name=QDRANT_COLLECTION, limit=100, with_payload=True, scroll_filter=flt, offset=next_page
+            )
+            for p in page:
+                txt = p.payload.get("text", "") or ""
+                md = p.payload.get("metadata", {}) or {}
+                name = md.get("source_name") or ""
+
+                # naive parse: extract Details / Dimension / Domain lines (present in your indexer text) [1](https://kpmgindia365-my.sharepoint.com/personal/sourabkundu_kpmg_com/Documents/Microsoft%20Copilot%20Chat%20Files/meta.json)
+                def _grab(label):
+                    m = re.search(fr"{label}:\s*(.+)", txt, flags=re.I)
+                    return (m.group(1).strip() if m else "")
+
+                rules_rows.append({
+                    "Rule Name": name,
+                    "Details": _grab("Details"),
+                    "Dimension": _grab("Dimension"),
+                    "Domain": _grab("Domain")
+                })
+            if not next_page:
+                break
+
+        # render a Markdown table
+        def _table(rows):
+            if not rows: return "No dq_rules found."
+            hdr = "| Rule Name | Details | Dimension | Domain |\n|---|---|---|---|"
+            lines = [hdr] + [f"| {r['Rule Name']} | {r['Details']} | {r['Dimension']} | {r['Domain']} |" for r in rows]
+            return "\n".join(lines)
+
+        table_block = _table(rules_rows)
+        # now prepend this table into the prompt (similar to how we add the totals table)
+
+        if re.search(r"\btop\b.*\bfailed\s+rule(s)?\b", q_lower):
+            user_prompt = (
+                f"You are a Data Quality analytics assistant.\n\n"
+                f"Top-5 failed rules (derived):\n{top5_block}\n\n"
+                f"Context:\n{context_block}\n\nQuestion:\n{req.query}\n"
+            )
+        else:
+            user_prompt = (
+                f"You are a Data Quality analytics assistant.\n\n"
+                f"Rules catalog table derived from context:\n{table_block}\n\n"
+                f"Question:\n{req.query}\n"
+            )
+
+    # Unchanged: generate analysis from Gemini
     resp = genai_client.models.generate_content(
         model=os.getenv("GEN_MODEL", "gemini-2.5-flash"),
         contents=user_prompt,
