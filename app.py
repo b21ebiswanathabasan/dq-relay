@@ -1349,7 +1349,7 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
         f"[{s.get('source_type','doc')}] {s.get('source_name','')} {s.get('path_or_table','')}\n" + _ctx(s)
         for s in sources
     ) if sources else "No context."
-
+    user_prompt = f"{system_prompt}\n\nContext:\n{context_block}\n\nQuestion:\n{req.query}\n"
     # CHANGED: if the query is about valid vs invalid totals, prepend the table
 
     # ADDED: If the query asks for dq_rules in "tabular format", fetch ALL dq_rules via scroll and render a table
