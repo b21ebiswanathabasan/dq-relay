@@ -29,7 +29,7 @@ from qdrant_client.http.models import (
 
 import re
 # --- Relevance knobs ---
-MAX_SOURCES = int(os.getenv("MAX_SOURCES", "5"))  # cap how many sources we return/display
+MAX_SOURCES = int(os.getenv("MAX_SOURCES", "10"))  # cap how many sources we return/display
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0.35"))  # drop weak matches (tune 0.30–0.50)
 
 
@@ -69,24 +69,30 @@ def _soft_contains(hay: str, needle: str) -> bool:
     return needle.lower() in (hay or "").lower()
 
 
+
+
+
 def query_driven_filters(query: str) -> Dict[str, Any]:
     q = (query or "").lower()
-    filters = {}
+    filters: Dict[str, Any] = {}
 
-    # Inventory of available DQ rules -> prefer dq_rules catalog
-    if re.search(r"\bhow many\b.*\bdq rules\b|\bavailable\b.*\bdq rules\b", q):
-        filters["source_type"] = ["dq_rules"]  # OR list allowed in build_filter()
+    # Catalog: "how many/available/existing dq rules"
+    if re.search(r"\b(how\s+many|available|existing)\b.*\bdq\s+rules\b", q):
+        filters["source_type"] = ["dq_rules"]
 
-    # Top-N failed rules -> prefer dq_run_report & summary (not profile)
-    if re.search(r"\btop\b.*\bfailed rule(s)?\b", q):
+    # Profile-applied rules: support "rules applied" and "applied dq rules"
+    if re.search(r"\b(rules\s+applied|applied\s+dq\s+rules)\b.*\b(profile|data\s+profile)\b", q):
+        filters["source_type"] = ["profile_summary"]
+        # Optional: capture profile name (e.g., "... for 10K_Customer")
+        m = re.search(r"\b(profile|data\s+profile)\b\s*(?:for|:)?\s*([A-Za-z0-9_]+)", q)
+        if m:
+            filters["extra.profile_name"] = [m.group(2)]  # payload index exists
+
+    # Top-N failed rules: prefer DQ runs
+    if re.search(r"\btop\b.*\bfailed\s+rule(s)?\b", q):
         filters["source_type"] = ["dq_run_report"]
 
-    # Profile-applied rules -> prefer profile_summary sources
-    if re.search(r"\brules applied\b.*\bprofile\b", q):
-        filters["source_type"] = ["profile_summary"]
-
     return filters
-
 
 def nudge_intent_for_analytics(query: str) -> bool:
     q = (query or "").lower()
@@ -1173,7 +1179,7 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     results = client.search(
         collection_name=QDRANT_COLLECTION,
         query_vector=("default", qvec),
-        limit=max(5, req.top_k),  # minimal recall; cap sources separately
+        limit=max(20, req.top_k),  # minimal recall; cap sources separately
         with_payload=True,
         score_threshold=MIN_SCORE,
         query_filter=q_filter,
@@ -1182,7 +1188,7 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
         results = client.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=("default", qvec),
-            limit=max(5, req.top_k),
+            limit=max(20, req.top_k),
             with_payload=True,
             score_threshold=max(0.20, MIN_SCORE * 0.8),
             query_filter=None,
