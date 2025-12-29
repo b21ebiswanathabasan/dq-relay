@@ -28,6 +28,11 @@ from qdrant_client.http.models import (
 )
 
 import re
+# --- Relevance knobs ---
+MAX_SOURCES = int(os.getenv("MAX_SOURCES", "5"))  # cap how many sources we return/display
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.35"))  # drop weak matches (tune 0.30–0.50)
+
+
 
 
 def ensure_payload_indexes(client: QdrantClient):
@@ -39,7 +44,8 @@ def ensure_payload_indexes(client: QdrantClient):
         "metadata.source_type",
         "metadata.source_name",
         "metadata.path_or_table",
-        "metadata.extra.run_id",  # helpful for run-scoped queries
+        "metadata.extra.run_id",
+        "metadata.extra.profile_name",  # helpful for run-scoped queries
         # Optional (if you plan to filter by these later):
         # "metadata.extra.report_name",
         # "metadata.extra.rule_names",  # arrays are supported; treated as keyword list
@@ -88,10 +94,6 @@ def nudge_intent_for_analytics(query: str) -> bool:
             "count of failures", "percent null", "grouped by"]
     return any(k in q for k in keys)
 
-
-# --- Relevance knobs ---
-MAX_SOURCES = int(os.getenv("MAX_SOURCES", "6"))  # cap how many sources we return/display
-MIN_SCORE = float(os.getenv("MIN_SCORE", "0.35"))  # drop weak matches (tune 0.30–0.50)
 
 
 # --- Highest-score text per (type, name, path, run_id) ---
@@ -833,11 +835,14 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
 
         # Enrich DQ run meta (JSON or KV) so analytics can use contributions/dimensions
         summary_chunk = None
+        meta_json_chunk = None
+
         if isinstance(obj, dict) and obj.get("run_id") and obj.get("report_name"):
             run_id = obj.get("run_id")
             report_name = obj.get("report_name")
             rule_names = obj.get("rule_names") or []
             overall_dq = obj.get("overall_dq")
+
             md.source_type = md.source_type or "dq_run_report"
             md.source_name = md.source_name or f"{report_name} (Run {run_id})"
             md.extra = (md.extra or {})
@@ -851,7 +856,7 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
                 "dimension_counts_map": obj.get("dimension_counts_map"),
             })
 
-            # ➊ NEW: add a JSON meta chunk to 'text' so _collect_run_meta sees it
+            # NEW: add a JSON meta chunk to 'text' so _collect_run_meta can read it
             meta_json_chunk = json.dumps({
                 "run_id": run_id,
                 "report_name": report_name,
@@ -862,6 +867,7 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
                 "dimension_counts_map": obj.get("dimension_counts_map"),
             }, ensure_ascii=False)
 
+            # Keep your preview chunk
             preview_names = ", ".join(rule_names[:6]) if rule_names else ""
             summary_chunk = (
                 f"Report: {report_name}\n"
@@ -870,12 +876,13 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
                 f"Rules: {preview_names}"
             )
 
-        # Chunking with optional summary + meta JSON
+        # Chunking with optional meta JSON + summary
         chunks = []
         if meta_json_chunk:
-            chunks.append(meta_json_chunk)  # ➋ NEW: JSON meta goes first (starts with '{')
+            chunks.append(meta_json_chunk)  # ensure a JSON chunk exists and starts with '{'
         if summary_chunk:
             chunks.append(summary_chunk)
+
         tokens = item.text.split()
         i = 0
         while i < len(tokens):
@@ -905,12 +912,10 @@ def upsert_batch(payload: UpsertBatchRequest, _: None = Depends(check_auth)):
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, _: None = Depends(check_auth)):
-    
     if nudge_intent_for_analytics(req.query):
-        # call analytics directly to ensure top-N logic & recall
         aresp = analytics(AnalyticsRequest(
             query=req.query,
-            top_k=max(20, req.top_k),
+            top_k=max(5, req.top_k),  # minimal
             filters=req.filters,
             max_output_tokens=req.max_output_tokens,
             temperature=req.temperature
@@ -1123,7 +1128,7 @@ def _collect_run_meta(results):
         if st != "dq_run_report":
             continue
 
-        # ➊ Try JSON in text first (unchanged)
+        # First try JSON meta in text
         text = r.payload.get("text","") or ""
         if text.strip().startswith("{"):
             try:
@@ -1140,7 +1145,7 @@ def _collect_run_meta(results):
             except Exception:
                 pass
 
-        # ➋ NEW fallback: use metadata.extra if present
+        # NEW: fallback to metadata.extra (covers older items)
         extra = meta.get("extra") or {}
         rid   = extra.get("run_id")
         if rid:
@@ -1168,7 +1173,7 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
     results = client.search(
         collection_name=QDRANT_COLLECTION,
         query_vector=("default", qvec),
-        limit=max(20, req.top_k),  # restore min 20 for analytics recall
+        limit=max(5, req.top_k),  # minimal recall; cap sources separately
         with_payload=True,
         score_threshold=MIN_SCORE,
         query_filter=q_filter,
@@ -1177,7 +1182,7 @@ def analytics(req: AnalyticsRequest, _: None = Depends(check_auth)):
         results = client.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=("default", qvec),
-            limit=max(20, req.top_k),
+            limit=max(5, req.top_k),
             with_payload=True,
             score_threshold=max(0.20, MIN_SCORE * 0.8),
             query_filter=None,
@@ -1293,7 +1298,7 @@ def smart(req: SmartRequest, _: None = Depends(check_auth)):
     if intent == Intent.analytics:
         resp = analytics(AnalyticsRequest(
             query=req.query,
-            top_k=max(20, req.top_k),
+            top_k=max(5, req.top_k),
             filters=req.filters, temperature=req.temperature, max_output_tokens=req.max_output_tokens
         ))
         return SmartResponse(intent=intent, analysis=resp.analysis, sources=resp.sources)
